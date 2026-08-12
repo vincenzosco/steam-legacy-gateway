@@ -36,9 +36,10 @@ against packet captures from a real 2013 client:
 | Hosts generation / routing | ✅ complete | `gateway/hosts.py`, `scripts/install_hosts.sh` |
 | TLS termination + HTTPS forwarding | ✅ complete | SNI routing, per-host certs, local CA; smoke-tested |
 | Content bridge (legacy URLs → depot cache) | ✅ complete | minimal HTTP origin + cache + fetcher |
-| Legacy CM framing + EMsg layer | ✅ complete | `VT01` protobuf + struct-in-VT01 handshake framing, unit-tested |
+| Legacy CM framing + EMsg layer | ✅ complete | renumbered EMsg set (from the binary's own table), VT01 + proto-flag framing, unit-tested |
+| Steam Guard MachineAuth flow | ✅ complete | all 6 MachineAuth messages + NewLoginKey pair, job-id targeting, persistent sentry store, integration-tested end-to-end |
 | Modern back-end (ValvePython/steam) | ⚠️ complete code, needs your account | install `steam`, set credentials in config |
-| CM translator / message mapping | ⚠️ grounded skeleton | see [docs/PROTOCOL_ANALYSIS.md](docs/PROTOCOL_ANALYSIS.md) — server-initiated channel encrypt + protobuf logon flow implemented from binary evidence; exact wire details still need a capture |
+| CM translator / message mapping | ✅ grounded | see [docs/PROTOCOL_ANALYSIS.md](docs/PROTOCOL_ANALYSIS.md) — channel encrypt + protobuf logon + post-logon set implemented from the binary + 2015-era SteamKit; the AES/session-key question is the remaining capture item |
 | Auth impersonation | ⚠️ structural only | the gateway owns the modern login; legacy session emulation is partial |
 
 **Why the translator can't be finished blind:** the 2013 logon flow involved RSA-encrypted

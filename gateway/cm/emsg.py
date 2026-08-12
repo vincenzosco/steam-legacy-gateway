@@ -1,39 +1,60 @@
-"""EMsg constants used by the 2013-era Steam client.
+"""EMsg constants used by the Oct-2015 Steam client (the last Lion-era build).
 
-Values are taken from SteamKit's public `EMsg` enum (SteamRE/SteamKit) and
-SteamDatabase's tracked protocol dumps. The 2013-era client used the classic
-binary messages below; protobuf messages (940+) use the VT01 framing with the
-protobuf header carrying the EMsg's job info.
+Values are the **renumbered** EMsg set, proven by two independent sources:
 
-NOTE: these are the stable, well-known values. Exact 2013 behaviour for the
-message *bodies* should be verified against packet captures before relying on
-field-level parsing (see cm/framing.py and cm/translator.py comments).
+  1. the client's own binary name→value table (scripts/_scan_emsg.py extracts it),
+  2. SteamKit's `emsg.steamd` at commit 9b4807eb (2015-10-24, ten days after
+     the client's build date).
+
+Steam renumbered its EMsg enum well before this client shipped; the "classic"
+values used by steamkit-python's docs (704 logon, 940 response, 761 token,
+762 CMList, 130/131/132 channel encrypt, 133 multi) do **not** match this
+client. Every number below was cross-checked against the binary's own table.
+
+Wire detail: protobuf messages carry the `0x80000000` proto flag OR'd into the
+EMsg field (see cm/framing.py). The values here are the *unflagged* message ids.
 """
 from __future__ import annotations
 
 # --- Channel encryption handshake (first thing on a new connection) ----------
-ChannelEncryptRequest = 130
-ChannelEncryptResponse = 131
-ChannelEncryptResult = 132
-Multi = 133  # multiple messages batched into one frame
+ChannelEncryptRequest = 1303
+ChannelEncryptResponse = 1304
+ChannelEncryptResult = 1305
 
-# --- Client logon / heartbeat (legacy binary messages) ----------------------
+# --- Batching -----------------------------------------------------------------
+Multi = 1  # CMsgMulti — multiple messages batched into one frame
+
+# --- Client logon / session (protobuf, VT01) ----------------------------------
+ClientLogon = 5514
+ClientLogOnResponse = 751
+ClientSessionToken = 850
+ClientLoggedOff = 757
+ClientLogOff = 706
+ClientSetHeartbeatRate = 755
 ClientHeartBeat = 703
-ClientLogon = 704
-ClientLogonResponse = 705
-ClientLoggedOff = 706
-ClientVACBanStatus = 707
-ClientNewLoginKey = 712
-ClientNewLoginKeyAccepted = 713
-ClientSetHeartbeatRate = 718
-ClientGamesPlayed = 720
+ClientVACBanStatus = 782
+ClientAccountInfo = 768
+ClientCMList = 783
+ClientServerList = 880
+ClientAppInfoUpdate = 866
+ClientGamesPlayed = 742
+ClientLogonGameServer = 5559
 
-# --- Protobuf-era equivalents (VT01 framing) ---------------------------------
-# Confirmed in the Oct-2015 client binary (k_EMsgClient* strings) + SteamKit.
-ClientLogOnResponse = 940
-ClientSessionToken = 761
-ClientCMList = 762
-ClientUpdateAppInfo = 745
+# --- Steam Guard machine auth -------------------------------------------------
+ClientRequestMachineAuth = 5541
+ClientRequestMachineAuthResponse = 5542
+ClientUpdateMachineAuth = 5537
+ClientUpdateMachineAuthResponse = 5538
+ClientReadMachineAuth = 5539
+ClientReadMachineAuthResponse = 5540
+
+# --- Login key (passwordless re-logon) ----------------------------------------
+ClientNewLoginKey = 5463
+ClientNewLoginKeyAccepted = 5464
+
+# --- Deprecated (present in the enum, never sent by this client) -------------
+ClientLogOn_Deprecated = 701
+ClientAnonLogOn_Deprecated = 702
 
 _NAMES: dict[int, str] = {}
 

@@ -58,6 +58,23 @@ class ModernSession:
         """True when the modern login completed successfully (not failed)."""
         return bool(self._ready) and self._ready.done() and self._ready.exception() is None
 
+    def steam_id(self) -> int:
+        """The modern session's SteamID as a 64-bit int, or 0 if unknown.
+
+        Safe to call from any thread (plain attribute read of the SteamClient
+        set by the gevent thread).
+        """
+        client = self._client
+        if client is None:
+            return 0
+        sid = getattr(client, "steam_id", None)
+        if sid is None:
+            return 0
+        try:
+            return int(sid)  # SteamID has __int__ / as_64
+        except (TypeError, ValueError):
+            return 0
+
     # -- gevent-thread internals -----------------------------------------------
 
     def _emit(self, event: dict[str, Any]) -> None:

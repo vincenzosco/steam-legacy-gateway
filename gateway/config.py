@@ -19,6 +19,7 @@ DEFAULTS: dict[str, Any] = {
         "listen_ports": [27017, 27018, 27019, 27020],
         "modern_cm_host": "",
         "capture_dir": "",  # set to e.g. captures/ to log every connection's raw bytes
+        "sentry_store": "config/sentries.json",  # Steam Guard sentry persistence
     },
     "account": {"username": "", "password": "", "steam_guard": ""},
     "content": {
@@ -53,12 +54,13 @@ def load_config(path: str | Path | None = None) -> dict[str, Any]:
                 cfg = _deep_merge(cfg, yaml.safe_load(fh) or {})
     # Resolve paths relative to the project root.
     def _resolve(key: str) -> None:
-        for section in ("tls", "content"):
+        for section in ("tls", "content", "cm"):
             if key in cfg.get(section, {}):
                 cfg[section][key] = str(PROJECT_ROOT / cfg[section][key])
 
     _resolve("cert_dir")
     _resolve("cache_dir")
+    _resolve("sentry_store")
     return cfg
 
 

@@ -5,6 +5,7 @@ import pytest
 
 from gateway.cm import emsg
 from gateway.cm.framing import (
+    PROTO_FLAG,
     FramingError,
     decode_frame,
     encode_legacy,
@@ -28,11 +29,29 @@ def test_proto_roundtrip():
     body = b"\x10\x02"
     raw = encode_proto(emsg.ClientLogOnResponse, header, body)
     assert raw[4:8] == b"VT01"
+    # the wire EMsg must carry the 0x80000000 proto flag (MsgUtil.MakeMsg)
+    (raw_emsg,) = __import__("struct").unpack_from("<I", raw[4:], 4)
+    assert raw_emsg & PROTO_FLAG
+    assert raw_emsg & ~PROTO_FLAG == emsg.ClientLogOnResponse
     frame = decode_frame(raw[4:])
     assert frame.emsg == emsg.ClientLogOnResponse
     assert frame.header == header
     assert frame.body == body
     assert frame.proto is True
+
+
+def test_proto_flag_stripped_on_decode():
+    # A client-sent proto message arrives with the flag; we must strip it.
+    payload = (
+        b"VT01"
+        + __import__("struct").pack("<I", emsg.ClientLogon | PROTO_FLAG)
+        + __import__("struct").pack("<I", 0)
+        + b"\x08\x01"
+    )
+    frame = decode_frame(payload)
+    assert frame.emsg == emsg.ClientLogon
+    assert frame.proto is True
+    assert frame.body == b"\x08\x01"
 
 
 def test_truncated_frames_raise():

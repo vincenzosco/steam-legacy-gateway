@@ -1,21 +1,18 @@
 """Minimal Protocol Buffers (proto2 wire format) codec.
 
-Enough to read/write the handful of CMsg* messages the legacy client uses:
+Enough to read/write the handful of CMsg* messages the legacy client uses.
+Field numbers follow the Oct-2015-era generated SteamKit protos (SteamKit
+commit 9b4807eb, 2015-10-24), which mirror SteamDatabase/SteamTracking:
 
-    CMsgClientLogon           account_name = 1 (string), password = 2 (bytes), ...
-    CMsgClientLogonResponse   eresult      = 1 (int32)
-    CMsgClientSessionToken    token        = 1 (uint64)
-    CMsgProtoBufHeader        client_steam_id = 1 (fixed64),
-                              client_session_id = 2 (int32)
-    CMsgMulti                 size_unzipped = 1? message_body = ... (see below)
+    CMsgClientLogon           account_name = 50 (string), password = 51 (bytes)
+    CMsgClientLogonResponse   eresult = 1 (int32), out_of_game_heartbeat_seconds = 2
+    CMsgClientSessionToken    token = 1 (uint64)
+    CMsgProtoBufHeader        steamid = 1 (fixed64), client_sessionid = 2 (int32),
+                              jobid_source = 10 (fixed64), jobid_target = 11 (fixed64)
+    CMsgMulti                 size_unzipped = 1 (int32), message_body = 2 (bytes)
 
-Field numbers follow SteamDatabase/SteamTracking protobufs (public). Wire
-format is deterministic per the protobuf spec. Verified-by-capture is still
-recommended (see docs/PROTOCOL_ANALYSIS.md).
-
-NOTE on CMsgMulti field numbers: the public definition (steammessages_base.proto)
-uses `message_body = 1` (bytes) and `size_unzipped = 2` (int32). A hand-rolled
-walker must therefore decode fields generically rather than trusting offsets.
+Wire format is deterministic per the protobuf spec. Verified-by-capture is
+still recommended (see docs/PROTOCOL_ANALYSIS.md).
 """
 from __future__ import annotations
 
@@ -126,4 +123,14 @@ def field_varint(field: int, data: bytes, default: int = 0) -> int:
     for f in parse_fields(data):
         if f.number == field and f.wire == WIRE_VARINT:
             return int(f.value)
+    return default
+
+
+def field_fixed64(field: int, data: bytes, default: int = 0) -> int:
+    """Decode a fixed64 (WIRE_FIXED64) field as an int (e.g. job ids)."""
+    import struct
+
+    for f in parse_fields(data):
+        if f.number == field and f.wire == WIRE_FIXED64:
+            return struct.unpack("<Q", bytes(f.value))[0]
     return default

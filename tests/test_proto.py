@@ -32,7 +32,18 @@ def test_field_missing():
 
 
 def test_logon_shaped_message():
-    # Mimic CMsgClientLogon: account_name=1, password=2 (RSA blob).
-    logon = proto.string_field(1, "vincenzosco") + proto.bytes_field(2, b"\x00" * 128)
-    assert proto.field_text(1, logon) == "vincenzosco"
-    assert len(proto.field_bytes(2, logon)) == 128
+    # Mimic CMsgClientLogon: account_name=50, password=51 (RSA blob).
+    logon = proto.string_field(50, "vincenzosco") + proto.bytes_field(51, b"\x00" * 128)
+    assert proto.field_text(50, logon) == "vincenzosco"
+    assert len(proto.field_bytes(51, logon)) == 128
+
+
+def test_field_fixed64():
+    import struct
+
+    msg = proto.fixed64_field(11, 0x1234)
+    assert proto.field_fixed64(11, msg) == 0x1234
+    assert proto.field_fixed64(10, msg) == 0  # absent
+    packed = struct.pack("<Q", 0xFFFFFFFFFFFFFFFF)
+    msg2 = proto.fixed64_field(10, 0xFFFFFFFFFFFFFFFF)
+    assert proto.field_fixed64(10, msg2) == 0xFFFFFFFFFFFFFFFF

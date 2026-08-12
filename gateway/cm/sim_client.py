@@ -4,11 +4,17 @@ Runs the exact protocol the Oct-2015 client uses (per docs/PROTOCOL_ANALYSIS.md)
 against the gateway's CM listener, so the handshake bytes can be captured and
 verified without a 32-bit Lion machine:
 
-    1. server -> client  ChannelEncryptRequest (130, struct-in-VT01, challenge)
-    2. client -> server  ChannelEncryptResponse (131) — session key blob
-    3. server -> client  ChannelEncryptResult (132) — EResult
-    4. client -> server  ClientLogon (704, protobuf) — account + password
-    5. server -> client  ClientLogOnResponse (940) [+ ClientSessionToken 761]
+    1. server -> client  ChannelEncryptRequest (1303, struct-in-VT01,
+                          body = [protocol_version][universe])
+    2. client -> server  ChannelEncryptResponse (1304) — session key blob
+    3. server -> client  ChannelEncryptResult (1305) — EResult
+    4. client -> server  ClientLogon (5514, protobuf, proto-flagged) —
+                          CMsgClientLogon account_name=50 / password=51
+    5. server -> client  ClientLogOnResponse (751) [+ ClientSessionToken 850]
+    6. server -> client  ClientUpdateMachineAuth (5537) — Steam Guard sentry
+       client -> server  ClientUpdateMachineAuthResponse (5538) — SHA of written file
+    7. server -> client  ClientNewLoginKey (5463) — passwordless re-logon token
+       client -> server  ClientNewLoginKeyAccepted (5464)
 
 If the gateway has no modern session configured, step 5 will be a *refusal* —
 that still exercises the full wire path and is what gets captured.
@@ -19,10 +25,11 @@ by the integration test).
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import struct
 from dataclasses import dataclass, field
 
-from gateway.cm import emsg, proto
+from gateway.cm import emsg, machineauth, proto
 from gateway.cm.framing import Frame, encode_handshake, encode_proto, read_frame
 
 HEX = "0123456789abcdef"
@@ -57,6 +64,10 @@ class HandshakeResult:
     channel_result: int | None = None
     logon_eresult: int | None = None
     session_token: int | None = None
+    sentry_job_id: int | None = None
+    sentry_filename: str = ""
+    sentry_sha: bytes = b""
+    login_key_unique_id: int | None = None
     error: str = ""
 
     def render_capture(self) -> str:
@@ -86,14 +97,19 @@ async def run_handshake(host: str = "127.0.0.1", port: int = 27017,
                         account: str = "simuser",
                         password: bytes = b"\x00" * 128,
                         session_key: bytes = b"\x42" * 128) -> HandshakeResult:
-    """Perform the legacy handshake against a gateway CM listener."""
+    """Perform the legacy handshake + MachineAuth exchange against a gateway."""
     result = HandshakeResult(ok=False)
     reader, writer = await asyncio.open_connection(host, port)
     try:
-        # 1. server -> client: ChannelEncryptRequest (challenge)
+        # 1. server -> client: ChannelEncryptRequest ([protocol_version][universe])
         f = await _read_expect(reader, emsg.ChannelEncryptRequest, "ChannelEncryptRequest")
+        if len(f.body) >= 8:
+            proto_ver, universe = struct.unpack_from("<II", f.body, 0)
+            note = f"proto_v={proto_ver} universe={universe}"
+        else:
+            note = f"challenge={len(f.body)}B"
         result.frames.append(CapturedFrame("<", f.emsg, f.name, f.body, f.raw,
-                                           note=f"challenge={len(f.body)}B"))
+                                           note=note))
 
         # 2. client -> server: ChannelEncryptResponse
         #    [protocol_version:4][key_size:4][key][crc32:4][end_flag:4]
@@ -119,11 +135,11 @@ async def run_handshake(host: str = "127.0.0.1", port: int = 27017,
             return result
 
         # 4. client -> server: protobuf ClientLogon
-        #    CMsgClientLogon: account_name=1, password=2, protocol_version=3
+        #    CMsgClientLogon: account_name=50, password=51, protocol_version=1
         logon = (
-            proto.string_field(1, account)
-            + proto.bytes_field(2, password)
-            + proto.varint_field(3, 65542)
+            proto.varint_field(1, 65542)  # protocol_version
+            + proto.string_field(50, account)
+            + proto.bytes_field(51, password)
         )
         out = encode_proto(emsg.ClientLogon, b"", logon)
         writer.write(out)
@@ -131,20 +147,60 @@ async def run_handshake(host: str = "127.0.0.1", port: int = 27017,
         result.frames.append(CapturedFrame(">", emsg.ClientLogon, "ClientLogon",
                                            logon, out, note=f"account={account}"))
 
-        # 5. server -> client: ClientLogOnResponse (940)
+        # 5. server -> client: ClientLogOnResponse (751)
         f = await _read_expect(reader, emsg.ClientLogOnResponse, "ClientLogOnResponse")
         result.logon_eresult = proto.field_varint(1, f.body)
         result.frames.append(CapturedFrame("<", f.emsg, f.name, f.body, f.raw,
                                            note=f"eresult={result.logon_eresult}"))
 
-        # 6. on success the gateway also sends ClientSessionToken (761)
-        if result.logon_eresult == 1:
-            f = await asyncio.wait_for(read_frame(reader), timeout=5)
-            if f is not None and f.emsg == emsg.ClientSessionToken:
+        if result.logon_eresult != 1:
+            result.ok = True  # refusal is a valid (and capturable) outcome
+            return result
+
+        # 6. post-logon exchange — handle frames until MachineAuth + LoginKey done
+        seen = {"token": False, "account_info": False, "cm_list": False,
+                "machineauth": False, "login_key": False}
+        timeout = 15
+        while not (seen["machineauth"] and seen["login_key"]):
+            f = await asyncio.wait_for(read_frame(reader), timeout=timeout)
+            if f is None:
+                break
+            if f.emsg == emsg.ClientSessionToken and not seen["token"]:
                 result.session_token = proto.field_varint(1, f.body)
                 result.frames.append(CapturedFrame(
                     "<", f.emsg, f.name, f.body, f.raw,
                     note=f"token={result.session_token}"))
+                seen["token"] = True
+            elif f.emsg == emsg.ClientAccountInfo:
+                result.frames.append(CapturedFrame(
+                    "<", f.emsg, f.name, f.body, f.raw,
+                    note="persona/account info"))
+                seen["account_info"] = True
+            elif f.emsg == emsg.ClientCMList:
+                result.frames.append(CapturedFrame(
+                    "<", f.emsg, f.name, f.body, f.raw, note="cm rotation list"))
+                seen["cm_list"] = True
+            elif f.emsg == emsg.ClientUpdateMachineAuth and not seen["machineauth"]:
+                result.frames.append(CapturedFrame(
+                    "<", f.emsg, f.name, f.body, f.raw, note="sentry push"))
+                seen["machineauth"] = True
+                await _reply_machine_auth(writer, f, result)
+            elif f.emsg == emsg.ClientNewLoginKey and not seen["login_key"]:
+                key = machineauth.parse_new_login_key(f.body)
+                result.login_key_unique_id = key.unique_id
+                result.frames.append(CapturedFrame(
+                    "<", f.emsg, f.name, f.body, f.raw,
+                    note=f"unique_id={key.unique_id}"))
+                seen["login_key"] = True
+                accept = machineauth.build_new_login_key_accepted(key.unique_id)
+                out = encode_proto(emsg.ClientNewLoginKeyAccepted, b"", accept)
+                writer.write(out)
+                await writer.drain()
+                result.frames.append(CapturedFrame(
+                    ">", emsg.ClientNewLoginKeyAccepted, "ClientNewLoginKeyAccepted",
+                    accept, out, note=f"unique_id={key.unique_id}"))
+            else:
+                log_unhandled(result, f)
         result.ok = True
         return result
     finally:
@@ -152,6 +208,35 @@ async def run_handshake(host: str = "127.0.0.1", port: int = 27017,
             writer.close()
         except Exception:
             pass
+
+
+async def _reply_machine_auth(writer: asyncio.StreamWriter,
+                              frame: Frame, result: HandshakeResult) -> None:
+    """Client writes the pushed sentry file and confirms (5537 -> 5538)."""
+    req = machineauth.parse_update_machine_auth(frame.body)
+    result.sentry_job_id = machineauth.jobid_source(frame.header)
+    result.sentry_filename = req.filename
+    result.sentry_sha = hashlib.sha1(req.bytes_).digest()
+    resp = machineauth.build_update_machine_auth_response(
+        filename=req.filename,
+        eresult=1,
+        filesize=len(req.bytes_),
+        sha_file=result.sentry_sha,
+        offset=req.offset,
+        cubwrote=len(req.bytes_),
+    )
+    header = machineauth.header(jobid_target=result.sentry_job_id)
+    out = encode_proto(emsg.ClientUpdateMachineAuthResponse, header, resp)
+    writer.write(out)
+    await writer.drain()
+    result.frames.append(CapturedFrame(
+        ">", emsg.ClientUpdateMachineAuthResponse, "ClientUpdateMachineAuthResponse",
+        resp, out, note=f"job={result.sentry_job_id} sha={result.sentry_sha.hex()}"))
+
+
+def log_unhandled(result: HandshakeResult, f: Frame) -> None:
+    result.frames.append(CapturedFrame(
+        "<", f.emsg, f.name, f.body, f.raw, note="(unhandled in sim)"))
 
 
 def main() -> int:  # pragma: no cover - thin CLI
@@ -177,7 +262,9 @@ def main() -> int:  # pragma: no cover - thin CLI
             print(f"\n[capture written to {p}]")
         print(f"\nchannel_eresult={res.channel_result} "
               f"logon_eresult={res.logon_eresult} "
-              f"session_token={res.session_token} ok={res.ok}")
+              f"session_token={res.session_token} "
+              f"sentry_sha={res.sentry_sha.hex() if res.sentry_sha else 'n/a'} "
+              f"login_key_unique_id={res.login_key_unique_id} ok={res.ok}")
         return 0 if res.ok else 1
 
     return asyncio.run(_run())

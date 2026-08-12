@@ -1,35 +1,41 @@
 """Legacy <-> modern CM message translator.
 
 Session state machine per legacy TCP connection (server = us, client = the
-2015-era Steam app):
+Oct-2015 Steam app):
 
     AWAIT_ENCRYPT -> CHANNEL_OPEN -> AWAIT_LOGON -> ACTIVE
-        (we send 130,          (client sends    (protobuf
-         client replies 131,    protobuf 704,    logon response
-         we send 132)            we reply 940)    + heartbeat loop)
+        (we send 1303,          (client sends    (protobuf
+         client replies 1304,    protobuf 5514,    logon response 751
+         we send 1305)            we reply 751)    + heartbeat loop
+                                                   + MachineAuth 5537/5538
+                                                   + NewLoginKey 5463/5464)
 
 The analysis in docs/PROTOCOL_ANALYSIS.md (grounded in the actual binary +
-SteamKit2 + steamkit-python) establishes:
+2015-era SteamKit) establishes:
 
-  * the channel-encrypt handshake is SERVER-INITIATED (we send
-    ChannelEncryptRequest with a challenge; the client replies
-    ChannelEncryptResponse with its AES session key; we confirm with
-    ChannelEncryptResult). Earlier code had this backwards.
-  * the client logs in with the PROTOBUF ClientLogon (EMsg 704 | proto flag)
-    and expects the protobuf ClientLogOnResponse (940) + ClientSessionToken
-    (761), not the pre-2013 binary logon response.
-  * post-handshake payloads are AES-encrypted with the session key. Whether we
-    can decrypt it (server-provided key vs key embedded in the client) is the
-    open question — see docs/PROTOCOL_ANALYSIS.md §2.2. Until then we store the
-    encrypted key blob for capture comparison.
+  * the channel-encrypt handshake is SERVER-INITIATED: we send
+    ChannelEncryptRequest (1303) with `[protocol_version:4][universe:4]`
+    (universe = EUniverse.Public = 1, matching SteamKit MsgChannelEncryptRequest);
+    the client replies ChannelEncryptResponse (1304) with its RSA-encrypted
+    session key; we confirm with ChannelEncryptResult (1305, eresult).
+  * the client logs in with the PROTOBUF ClientLogon (5514) whose body uses
+    CMsgClientLogon field numbers account_name=50 / password=51, and expects
+    the protobuf ClientLogOnResponse (751) + ClientSessionToken (850).
+  * protobuf messages carry the 0x80000000 proto flag on the wire
+    (cm/framing.py) — without it the client parses them as struct messages.
+  * after a successful logon the gateway completes the Steam Guard MachineAuth
+    flow (ClientUpdateMachineAuth 5537 -> response 5538, job-id targeted) and
+    offers a ClientNewLoginKey (5463) which the client accepts (5464), then
+    pushes ClientAccountInfo (768) + ClientCMList (783) so the client's
+    library/CM-rotation UI has data.
 
-VERIFY-BY-CAPTURE notes: exact handshake framing (struct-in-VT01 vs legacy),
-protobuf header field numbers, and the AES scheme are marked inline.
+VERIFY-BY-CAPTURE notes: exact AES scheme after the handshake and the session
+key's RSA story are the open questions (docs/PROTOCOL_ANALYSIS.md §2.2).
 """
 from __future__ import annotations
 
 import asyncio
-import gzip
+import hashlib
 import logging
 import os
 import struct
@@ -39,22 +45,25 @@ from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric import rsa
 
 from gateway.auth.bridge import Credentials, credentials_from_config
-from gateway.cm import emsg, proto
+from gateway.cm import emsg, machineauth, proto
 from gateway.cm.framing import Frame, decode_frame, encode_handshake, encode_legacy, encode_proto
 from gateway.cm.modern import ModernSession
 
 log = logging.getLogger("gateway.cm.translator")
 
 # Protocol version the gateway announces in ChannelEncryptRequest.
-# TODO-VERIFY: exact value expected by the 2015 client (capture).
+# SteamKit MsgChannelEncryptRequest.PROTOCOL_VERSION = 1; the client asserts it.
 CHANNEL_PROTOCOL_VERSION = 1
+# EUniverse.Public = 1 (SteamKit EUniverse enum).
+EUNIVERSE_PUBLIC = 1
 
-CHALLENGE_LEN = 16  # per steamkit-python wire docs: 16-byte challenge
+# Heartbeat seconds advertised in the logon response body (field 2).
+HEARTBEAT_SECONDS = 5
 
 
 class State(str, Enum):
-    AWAIT_ENCRYPT = "await_encrypt"  # we sent 130, awaiting client's 131
-    CHANNEL_OPEN = "channel_open"    # client's 131 accepted, we sent 132
+    AWAIT_ENCRYPT = "await_encrypt"  # we sent 1303, awaiting client's 1304
+    CHANNEL_OPEN = "channel_open"    # client's 1304 accepted, we sent 1305
     AWAIT_LOGON = "await_logon"
     AUTHENTICATING = "authenticating"
     ACTIVE = "active"
@@ -63,17 +72,37 @@ class State(str, Enum):
 class _ProtoLogon:
     """Minimal CMsgClientLogon reader (protobuf).
 
-    CMsgClientLogon (SteamDatabase protobufs): account_name = 1 (string),
-    password = 2 (bytes, RSA-encrypted), protocol_version = 3, client_os_type = 4,
-    client_language = 5, machine_id = 8 (bytes) ...
-    Only account_name is needed by the gateway (the modern session owns the
-    real login). VERIFY-BY-CAPTURE: field numbers.
+    CMsgClientLogon (Oct-2015 SteamKit): account_name = 50 (string),
+    password = 51 (bytes, RSA-encrypted), protocol_version = 1,
+    client_os_type = 7, client_language = 6, machine_id = 30,
+    should_remember_password = 8, sha_sentryfile = 83 (bytes), auth_code = 84.
+    Only account_name / sha_sentryfile are needed by the gateway (the modern
+    session owns the real login).
     """
 
     def __init__(self, body: bytes):
         self.body = body
-        self.account_name = proto.field_text(1, body) or ""
-        self.password_encrypted = proto.field_bytes(2, body) or b""
+        self.account_name = proto.field_text(50, body) or ""
+        self.password_encrypted = proto.field_bytes(51, body) or b""
+        self.sha_sentryfile = proto.field_bytes(83, body) or b""
+
+
+def _synthesize_steam_id(account: str) -> int:
+    """Stable placeholder SteamID derived from the account name.
+
+    universe=Public(1), type=Individual(1), instance=0, account_id from a
+    SHA-1 of the account name. The real value should come from the modern
+    session (ModernSession.steam_id) when available.
+    """
+    digest = hashlib.sha1(account.encode("utf-8")).digest()
+    account_id = struct.unpack("<I", digest[:4])[0]
+    return (1 << 56) | (1 << 52) | account_id
+
+
+def _ip_u32(ip: str) -> int:
+    """Dotted-quad IP -> uint32 as the client's NetHelpers expects (LE bytes)."""
+    octets = [int(part) for part in ip.split(".")]
+    return struct.unpack("<I", bytes(octets))[0]
 
 
 # The real CM serves one fixed RSA key; share a single key across sessions.
@@ -91,7 +120,7 @@ class TranslatorSession:
     """One legacy CM connection, translated onto the shared modern session."""
 
     def __init__(self, writer: asyncio.StreamWriter, cfg: dict,
-                 modern: ModernSession | None):
+                 modern: ModernSession | None, sentry_store=None):
         self.writer = writer
         self.cfg = cfg
         self.modern = modern
@@ -100,15 +129,25 @@ class TranslatorSession:
         self.session_id = 1
         self.session_token = os.urandom(8).hex()
         self._client_session_key_encrypted = b""
+        self._account = ""
+        self._next_job_id = 1
+        self.sentry_store = sentry_store or machineauth.SentinelStore(
+            cfg.get("cm", {}).get("sentry_store") or None
+        )
 
     # -- public ----------------------------------------------------------------
 
     async def start_handshake(self) -> None:
-        """Server-initiated channel encryption: send ChannelEncryptRequest(130)."""
-        challenge = os.urandom(CHALLENGE_LEN)
-        self.writer.write(encode_handshake(emsg.ChannelEncryptRequest, challenge))
+        """Server-initiated channel encryption: send ChannelEncryptRequest(1303).
+
+        Body is the MsgChannelEncryptRequest struct: [protocol_version:4]
+        [universe:4] — NOT a challenge (SteamKit 2015).
+        """
+        body = struct.pack("<II", CHANNEL_PROTOCOL_VERSION, EUNIVERSE_PUBLIC)
+        self.writer.write(encode_handshake(emsg.ChannelEncryptRequest, body))
         await self.writer.drain()
-        log.debug("sent ChannelEncryptRequest (challenge %d bytes)", len(challenge))
+        log.debug("sent ChannelEncryptRequest (proto v%d, universe %d)",
+                  CHANNEL_PROTOCOL_VERSION, EUNIVERSE_PUBLIC)
 
     async def handle(self, frame: Frame) -> None:
         log.debug("[%s] %s (proto=%s struct=%s, %d bytes)", self.state.value,
@@ -172,6 +211,7 @@ class TranslatorSession:
             return
         logon = _ProtoLogon(frame.body)
         self.state = State.AUTHENTICATING
+        self._account = logon.account_name
 
         if not logon.account_name:
             log.warning("protobuf ClientLogon without account_name "
@@ -183,59 +223,220 @@ class TranslatorSession:
             await self._send_logon_failure("modern session not ready")
             return
 
-        log.info("legacy logon for %r (password %d bytes, proto msg %d bytes)",
-                 logon.account_name, len(logon.password_encrypted), len(frame.body))
+        log.info("legacy logon for %r (password %d bytes, proto msg %d bytes, "
+                 "sha_sentryfile=%s)",
+                 logon.account_name, len(logon.password_encrypted), len(frame.body),
+                 logon.sha_sentryfile.hex() if logon.sha_sentryfile else "none")
         self.state = State.ACTIVE
-        await self._send_logon_success()
+        await self._send_logon_success(logon)
 
-    async def _send_logon_success(self) -> None:
-        # Protobuf ClientLogOnResponse (940): header carries client_steam_id (1)
-        # + client_session_id (2); body eresult (1) = EResult.OK.
-        header = (
-            proto.fixed64_field(1, self.steam_id)
-            + proto.varint_field(2, self.session_id)
+    async def _send_logon_success(self, logon: _ProtoLogon) -> None:
+        if self.steam_id == 0:
+            self.steam_id = self.modern.steam_id() if self.modern else 0
+        if self.steam_id == 0:
+            self.steam_id = _synthesize_steam_id(logon.account_name)
+
+        # Protobuf ClientLogOnResponse (751): header carries steamid (1) +
+        # client_sessionid (2); body eresult (1) = OK, heartbeat seconds (2).
+        header = machineauth.header(steamid=self.steam_id,
+                                    client_sessionid=self.session_id)
+        body = (
+            proto.varint_field(1, 1)  # EResult.OK
+            + proto.varint_field(2, HEARTBEAT_SECONDS)  # out_of_game_heartbeat_seconds
+            + proto.varint_field(3, HEARTBEAT_SECONDS)  # in_game_heartbeat_seconds
+            + proto.varint_field(5, 0)  # rtime32_server_time
+            + proto.varint_field(6, 0)  # account_flags
+            + proto.varint_field(7, 0)  # cell_id
+            + proto.string_field(21, "US")  # ip_country_code
         )
-        body = proto.varint_field(1, 1)  # EResult.OK
         await self._send_proto(emsg.ClientLogOnResponse, header, body)
-        # ClientSessionToken (761): token (1, uint64).
-        await self._send_proto(emsg.ClientSessionToken, b"",
+
+        # ClientSessionToken (850): token (1, uint64).
+        await self._send_proto(emsg.ClientSessionToken,
+                               machineauth.header(steamid=self.steam_id,
+                                                  client_sessionid=self.session_id),
                                proto.varint_field(1, int(self.session_token, 16)))
-        log.info("legacy session ACTIVE (steamid %d, session %d)", self.steam_id,
-                 self.session_id)
+
+        # ClientAccountInfo (768): persona_name=1, ip_country=2,
+        # count_authed_computers=5, account_flags=7.
+        info = (
+            proto.string_field(1, logon.account_name)
+            + proto.string_field(2, "US")
+            + proto.varint_field(5, 1)
+            + proto.varint_field(7, 0)
+        )
+        await self._send_proto(emsg.ClientAccountInfo,
+                               machineauth.header(steamid=self.steam_id,
+                                                  client_sessionid=self.session_id),
+                               info)
+
+        # ClientCMList (783): cm_addresses=1 (repeated uint32), cm_ports=2.
+        listen_ports = self.cfg.get("cm", {}).get("listen_ports", [27017])
+        gateway_ip = self.cfg.get("gateway_ip", "127.0.0.1")
+        cm_list = b"".join(proto.varint_field(1, _ip_u32(gateway_ip))
+                           for _ in listen_ports)
+        cm_list += b"".join(proto.varint_field(2, port) for port in listen_ports)
+        await self._send_proto(emsg.ClientCMList,
+                               machineauth.header(steamid=self.steam_id,
+                                                  client_sessionid=self.session_id),
+                               cm_list)
+
+        # Steam Guard MachineAuth flow: push a sentry file unless the client
+        # already presented the one we handed out.
+        stored_sha = self.sentry_store.sha_for(logon.account_name)
+        if not logon.sha_sentryfile or logon.sha_sentryfile != stored_sha:
+            await self._send_update_machine_auth(logon.account_name)
+
+        # Login key: offer a passwordless re-logon token.
+        await self._send_new_login_key(logon.account_name)
+
+        log.info("legacy session ACTIVE (steamid %d, session %d, account %r)",
+                 self.steam_id, self.session_id, logon.account_name)
 
     async def _send_logon_failure(self, reason: str) -> None:
-        body = proto.varint_field(1, 3)  # EResult.InvalidPassword placeholder
+        body = proto.varint_field(1, 3)  # EResult.NoConnection placeholder
         await self._send_proto(emsg.ClientLogOnResponse, b"", body)
         log.warning("legacy logon refused: %s", reason)
+
+    # -- Steam Guard machine auth ----------------------------------------------
+
+    async def _send_update_machine_auth(self, account: str) -> None:
+        """Server -> client ClientUpdateMachineAuth (5537).
+
+        Hands the client a sentry file to write to disk. The client replies
+        ClientUpdateMachineAuthResponse (5538) targeting our job id with the
+        SHA-1 of what it actually wrote. We remember the SHA so the next logon
+        (which presents sha_sentryfile=83) skips the push.
+        """
+        filename = machineauth.sentry_filename(account)
+        sentry_data = os.urandom(256)  # stand-in sentry blob for this era
+        entry = machineauth.SentryEntry(
+            filename=filename,
+            filesize=len(sentry_data),
+            sha_file=hashlib.sha1(sentry_data).digest(),
+            data=sentry_data,
+        )
+        self.sentry_store.put(account, entry)
+
+        job_id = self._next_job_id
+        self._next_job_id += 1
+        header = machineauth.header(jobid_source=job_id,
+                                    steamid=self.steam_id,
+                                    client_sessionid=self.session_id)
+        body = machineauth.build_update_machine_auth(filename, 0, sentry_data)
+        await self._send_proto(emsg.ClientUpdateMachineAuth, header, body)
+        log.info("sent ClientUpdateMachineAuth job=%d filename=%s (%d bytes)",
+                 job_id, filename, len(sentry_data))
+
+    async def _on_ClientUpdateMachineAuthResponse(self, frame: Frame) -> None:
+        """Client confirms it wrote our sentry file (5538)."""
+        resp = machineauth.parse_update_machine_auth_response(frame.body)
+        target_job = machineauth.jobid_target(frame.header)
+        log.info(
+            "ClientUpdateMachineAuthResponse job=%d filename=%s eresult=%d "
+            "filesize=%d cubwrote=%d sha=%s",
+            target_job, resp.filename, resp.eresult, resp.filesize,
+            resp.cubwrote, resp.sha_file.hex() if resp.sha_file else "none",
+        )
+        entry = self.sentry_store.get(self._account, resp.filename)
+        if entry is not None:
+            entry.filesize = resp.filesize or entry.filesize
+            entry.sha_file = resp.sha_file or entry.sha_file
+            self.sentry_store.put(self._account, entry)
+
+    async def _on_ClientReadMachineAuth(self, frame: Frame) -> None:
+        """Client asks for its stored sentry back (5539) -> serve it (5540)."""
+        req = machineauth.parse_read_machine_auth(frame.body)
+        entry = self.sentry_store.get(self._account, req.filename)
+        if entry is None:
+            log.info("ReadMachineAuth miss filename=%s (account %r)",
+                     req.filename, self._account)
+            body = machineauth.build_read_machine_auth_response(
+                req.filename, eresult=2, filesize=0, sha_file=b"",
+                offset=req.offset, bytes_read=b"")
+        else:
+            log.info("ReadMachineAuth hit filename=%s", req.filename)
+            body = machineauth.build_read_machine_auth_response(
+                req.filename, eresult=1, filesize=entry.filesize,
+                sha_file=entry.sha_file, offset=req.offset,
+                bytes_read=entry.data[req.offset:req.offset + req.cubtoread]
+                if req.cubtoread else entry.data)
+        # Client->server request: the client set jobid_source; the reply must
+        # echo it back as jobid_target (SteamKit job correlation).
+        job_id = machineauth.jobid_source(frame.header)
+        header = machineauth.header(jobid_target=job_id,
+                                    steamid=self.steam_id,
+                                    client_sessionid=self.session_id)
+        await self._send_proto(emsg.ClientReadMachineAuthResponse, header, body)
+
+    async def _on_ClientRequestMachineAuth(self, frame: Frame) -> None:
+        """Client uploads its sentry (5541) -> ack (5542)."""
+        req = machineauth.parse_request_machine_auth(frame.body)
+        # CMsgClientRequestMachineAuth carries only metadata (filename, filesize,
+        # sha_sentryfile) — no raw sentry bytes — so we record the hash.
+        entry = machineauth.SentryEntry(
+            filename=req.filename or machineauth.sentry_filename(self._account),
+            filesize=req.filesize,
+            sha_file=req.sha_sentryfile,
+            data=b"",
+        )
+        self.sentry_store.put(self._account, entry)
+        log.info("RequestMachineAuth filename=%s filesize=%d sha=%s",
+                 entry.filename, req.filesize,
+                 req.sha_sentryfile.hex() if req.sha_sentryfile else "none")
+        # Echo the client's jobid_source back as our jobid_target.
+        job_id = machineauth.jobid_source(frame.header)
+        header = machineauth.header(jobid_target=job_id,
+                                    steamid=self.steam_id,
+                                    client_sessionid=self.session_id)
+        await self._send_proto(emsg.ClientRequestMachineAuthResponse, header,
+                               machineauth.build_request_machine_auth_response(1))
+
+    # -- login key --------------------------------------------------------------
+
+    async def _send_new_login_key(self, account: str) -> None:
+        """Server -> client ClientNewLoginKey (5463); client accepts with 5464."""
+        unique_id = struct.unpack("<I", os.urandom(4))[0]
+        login_key = os.urandom(32).hex()
+        header = machineauth.header(steamid=self.steam_id,
+                                    client_sessionid=self.session_id)
+        body = machineauth.build_new_login_key(unique_id, login_key)
+        await self._send_proto(emsg.ClientNewLoginKey, header, body)
+        log.info("sent ClientNewLoginKey unique_id=%d", unique_id)
+
+    async def _on_ClientNewLoginKeyAccepted(self, frame: Frame) -> None:
+        key = machineauth.parse_new_login_key(frame.body)
+        log.info("client accepted new login key (unique_id=%d)", key.unique_id)
 
     # -- heartbeat / keepalive -------------------------------------------------
 
     async def _on_ClientHeartBeat(self, frame: Frame) -> None:
         log.debug("heartbeat")
 
-    async def _on_ClientNewLoginKey(self, frame: Frame) -> None:
-        # Client proposes a login key (712); server usually accepts it (713).
-        await self._send_legacy(emsg.ClientNewLoginKeyAccepted, b"")
-
     async def _on_ClientSetHeartbeatRate(self, frame: Frame) -> None:
-        await self._send_legacy(emsg.ClientSetHeartbeatRate, b"")
+        log.info("client set heartbeat rate (proto 755)")
+
+    async def _on_ClientLogOff(self, frame: Frame) -> None:
+        log.info("client logged off (706)")
 
     # -- protobuf messages from the legacy client ------------------------------
 
     async def _on_ClientCMList(self, frame: Frame) -> None:
-        log.info("legacy client asked for CM list (VT01) — ignored")
+        log.info("legacy client sent ClientCMList (unexpected direction)")
 
-    async def _on_ClientUpdateAppInfo(self, frame: Frame) -> None:
+    async def _on_ClientAppInfoUpdate(self, frame: Frame) -> None:
         log.info("legacy client asked for app info (VT01) — ignored")
 
     # -- plumbing --------------------------------------------------------------
 
     async def _handle_multi(self, frame: Frame) -> None:
-        # CMsgMulti (protobuf): message_body = 1 (bytes), size_unzipped = 2 (varint).
-        # When size_unzipped > 0 the body is gzip-compressed (SteamKit 2.5.0).
-        payload = proto.field_bytes(1, frame.body) or b""
-        size_unzipped = proto.field_varint(2, frame.body)
+        # CMsgMulti (protobuf): size_unzipped = 1 (int32), message_body = 2
+        # (bytes). When size_unzipped > 0 the body is gzip-compressed.
+        size_unzipped = proto.field_varint(1, frame.body)
+        payload = proto.field_bytes(2, frame.body) or b""
         if size_unzipped > 0:
+            import gzip
+
             try:
                 payload = gzip.decompress(payload)
             except (OSError, EOFError) as exc:
@@ -253,10 +454,6 @@ class TranslatorSession:
     async def _unmapped(self, frame: Frame) -> None:
         # Register mappings here as the protocol is verified (docs/PROTOCOL_ANALYSIS.md).
         pass
-
-    async def _send_legacy(self, emsg_id: int, body: bytes) -> None:
-        self.writer.write(encode_legacy(emsg_id, body))
-        await self.writer.drain()
 
     async def _send_proto(self, emsg_id: int, header: bytes, body: bytes) -> None:
         self.writer.write(encode_proto(emsg_id, header, body))

@@ -34,6 +34,18 @@ echo "=== EMsg constants (client*) ==="
 strings -a "$MACOS/steamclient.dylib" | grep -aE 'k_EMsgClient(Log|Session|CM|Account|App|Machine|NewLogin|LoggedOff|GamesPlayed|Chat)' | sort -u | head -40
 
 echo
+echo "=== EMsg name->number table extracted from the binary ==="
+# The client embeds a name->value table; scripts/_scan_emsg.py extracts it.
+# NOTE: this client uses the RENUMBERED EMsg set (logon=5514, response=751,
+# token=850, CMList=783, channel encrypt 1303-1305, MachineAuth 5537-5542) —
+# not the classic 704/940/761/762 values older docs cite.
+if python3 scripts/_scan_emsg.py 2>/dev/null | grep -aE 'k_EMsgClient(Logon|LogOnResponse|SessionToken|CMList|UpdateMachineAuth|NewLoginKey|ChannelEncrypt|Multi)' | head -20; then
+  :
+else
+  echo "(scripts/_scan_emsg.py needs the client at client/Steam.app)"
+fi
+
+echo
 echo "=== endpoints ==="
 strings -a "$MACOS/steamclient.dylib" | grep -aE 'steam\\.cm|cm[0-9]\\.steampowered|\\.steampowered\\.com|akamai|steamcontent' | sort -u | head -25
 
@@ -47,29 +59,12 @@ strings -a "$MACOS/steamclient.dylib" | grep -aE '[0-9]{1,3}(\\.[0-9]{1,3}){3}:[
 
 echo
 echo "=== embedded crypto keys? (whole bundle raw scan) ==="
-python3 - "$MACOS" <<'EOF'
-import os, sys
-root = sys.argv[1]
-sigs = [
-    (bytes.fromhex('dfec1ad6064ead197a'), 'valve-classic-1024 modulus'),
-    (b'BEGIN PUBLIC KEY', 'PEM public key'),
-    (b'BEGIN RSA PUBLIC KEY', 'PEM RSA key'),
-]
-hits = []
-for dirpath, _dirs, files in os.walk(root):
-    for fn in files:
-        p = os.path.join(dirpath, fn)
-        try:
-            if os.path.getsize(p) > 150 * 1024 * 1024:
-                continue
-            data = open(p, 'rb').read()
-        except OSError:
-            continue
-        for sig, name in sigs:
-            if data.find(sig) >= 0:
-                hits.append((p, name))
-print('\n'.join(f"{p}: {n}" for p, n in hits) if hits else "NONE — no embedded PEM/classic-Valve key found")
-EOF
+# Uses the exact EUniverse.Public DER from 2015-era SteamKit KeyDictionary.
+if python3 scripts/_scan_key.py "$MACOS"; then
+  :
+else
+  echo "(scripts/_scan_key.py needs the client at client/Steam.app)"
+fi
 
 echo
 echo "=== build path / version breadcrumbs ==="
