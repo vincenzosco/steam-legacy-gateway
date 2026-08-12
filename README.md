@@ -80,6 +80,37 @@ Then **install the CA on the Lion Mac** (the old client must trust the gateway's
 
 Start Steam on the Lion Mac. It should now talk only to the gateway.
 
+## Getting the client (the old Steam binary)
+
+The gateway needs an actual Lion-era Steam client to talk to. Valve no longer
+serves those builds, so we fetch one from the [Macintosh Garden archive](https://macintoshgarden.org/apps/steam):
+
+```bash
+./scripts/fetch_steam_client.sh             # download + verify MD5 + extract + freeze
+./scripts/fetch_steam_client.sh --dry-run   # just resolve the download URL
+./scripts/fetch_steam_client.sh --mirror macgdn  # use a specific static mirror
+```
+
+What it does:
+
+1. Downloads `Steam_MacOS_X_10.6_Snow_Leopard.zip` (~208 MB) — the **last build
+   that runs on OS X 10.6/10.7** (Snow Leopard / Lion).
+2. Verifies the MD5 (`67d20884...`) against the value published on Macintosh Garden.
+3. Extracts `Steam.app` into `client/`.
+4. Writes `Steam.cfg` (`BootStrapperInhibitAll=Enable`) into
+   `Steam.app/Contents/MacOS/` so the client **never auto-updates** itself.
+
+Notes:
+
+- This client can no longer log in to Valve's servers on its own — Macintosh
+  Garden users report it hangs at "Updating Steam Information". That is
+  expected, and it is the entire reason the gateway exists.
+- You can run the fetch script on the gateway machine, or directly on the Lion
+  Mac (it only needs `curl`, `unzip` and `md5`). Copy `client/Steam.app` over
+  if you fetch remotely.
+- Never let it update: if the freeze file is removed and the client upgrades
+  itself, it becomes a modern client that cannot run on Lion anyway.
+
 ## Services & ports
 
 | Port | Service |
