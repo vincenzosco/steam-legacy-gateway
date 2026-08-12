@@ -56,27 +56,21 @@ of this server-side at any time — that's inherent to the approach.
 
 ## Setup
 
-### On the gateway machine (modern Mac/PC)
+Full, end-to-end setup is in [`docs/SETUP.md`](docs/SETUP.md) — gateway machine, Lion machine,
+CA trust, hosts install, first run, and troubleshooting. The quick version:
 
 ```bash
-cd steam-legacy-gateway
+# gateway machine
+git clone https://github.com/vincenzosco/steam-legacy-gateway.git && cd steam-legacy-gateway
 python3 -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
-
-# optional but recommended for the content bridge:
-#   install DepotDownloader (https://github.com/SteamRE/DepotDownloader) and set
-#   `depot_downloader_path` in config/gateway.yaml
-
 cp config/gateway.yaml config/gateway.local.yaml   # edit credentials & IPs
-python -m gateway --gen-certs                       # create local CA + per-host certs
-python -m gateway                                    # start all services
+python -m gateway gen-certs                        # create local CA + per-host certs
+sudo python -m gateway run                          # start all services
+
+# lion machine: trust certs/steam-gateway-ca.crt in Keychain, then
+sudo ./scripts/install_hosts.sh <GATEWAY_IP>        # pure bash, no python needed
 ```
-
-Then **install the CA on the Lion Mac** (the old client must trust the gateway's certs):
-
-1. Copy `certs/steam-gateway-ca.crt` to the Lion machine.
-2. Open Keychain Access → drag the cert into **System** → trust it as root.
-3. Run `scripts/install_hosts.sh <GATEWAY_IP>` with sudo (backs up `/etc/hosts`).
 
 Start Steam on the Lion Mac. It should now talk only to the gateway.
 
