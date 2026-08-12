@@ -23,7 +23,7 @@ From `strings` on `steamclient.dylib` / `osx32/steam`:
 
 - **CM**: `cm0.steampowered.com` (DNS) **and hardcoded CM IPs** — e.g.
   `208.64.200.201:27017/27018/27019`, plus Valve-internal `172.16.3.x` leftovers.
-  ⚠️ **Hardcoded IPs bypass /etc/hosts.** A hosts-file redirect will not capture
+  **Hardcoded IPs bypass /etc/hosts.** A hosts-file redirect will not capture
   those connections; you need a router redirect or a PF rule on the Lion machine
   for port 27017-27020. (The client caches the CM list from `ClientCMList` too.)
 - **Web API**: `api.steampowered.com`, `api.beta.steampowered.com`
@@ -94,7 +94,7 @@ protobuf (MsgHdrProtoBuf): [emsg|0x80000000:4][header_len:4][header][body]
 - The channel-encrypt handshake messages (1303/1304/1305) are always struct.
 - Struct job ids are read-but-ignored by the client for handshake messages.
 
-Gateway status: implemented in `cm/framing.py` ✅ (unit + integration tested).
+Gateway status: implemented in `cm/framing.py` (unit + integration tested).
 
 ### 2.3 Channel encryption (server-initiated — confirmed from `CMClient.cs`)
 
@@ -114,7 +114,7 @@ then: AES-256-CBC/PKCS7 with session_key; optional HMAC-SHA1 (hash_key =
 session_key[:16], iv = HMAC(msg)[:13] + 3 random bytes, IV pre-encrypted AES-ECB)
 ```
 
-⚠️ The earlier analysis (steamkit-python) claimed the request body was a 16-byte
+The earlier analysis (steamkit-python) claimed the request body was a 16-byte
 challenge. The 2015-era SteamKit source shows the struct
 `[protocol_version][universe]`; the binary's `MsgChannelEncryptRequest_t`
 confirms it. The gateway now sends the struct body (8 bytes).
@@ -128,7 +128,7 @@ handshake. If the latter, a pure MITM works with no client modification. If the
 former, the only path is replacing the embedded key with the gateway's own (a
 single well-defined patch). This is the single most important unknown.
 
-✅ **Verified by the gateway's client simulator** (`gateway/cm/sim_client.py`,
+**Verified by the gateway's client simulator** (`gateway/cm/sim_client.py`,
 `tests/test_handshake_integration.py`): the full exchange — including the
 corrected request body, protobuf logon, and the MachineAuth flow — runs
 end-to-end and is captured byte-for-byte.
@@ -154,12 +154,12 @@ From SteamKit 2015 `CMClient`/`SteamUser` handlers and the binary's constants:
 
 | Message | EMsg | Purpose | Gateway |
 |---|---|---|---|
-| `ClientLogOnResponse` (proto) | 751 | eresult; header carries `client_sessionid` + `steamid`; body heartbeat seconds | ✅ |
-| `ClientSessionToken` (proto) | 850 | AM session token (u64), field `token` | ✅ |
-| `ClientAccountInfo` (proto) | 768 | persona_name (1), ip_country (2), count_authed_computers (5), account_flags (7) | ✅ |
-| `ClientCMList` (proto) | 783 | cm_addresses (1) / cm_ports (2) — sends the gateway's own listener so the client rotates to us | ✅ |
+| `ClientLogOnResponse` (proto) | 751 | eresult; header carries `client_sessionid` + `steamid`; body heartbeat seconds | implemented |
+| `ClientSessionToken` (proto) | 850 | AM session token (u64), field `token` | implemented |
+| `ClientAccountInfo` (proto) | 768 | persona_name (1), ip_country (2), count_authed_computers (5), account_flags (7) | implemented |
+| `ClientCMList` (proto) | 783 | cm_addresses (1) / cm_ports (2) — sends the gateway's own listener so the client rotates to us | implemented |
 | `ClientLoggedOff` | 757 | eresult on kick | handler-ready |
-| heartbeat | 703/755 | client heartbeats at `out_of_game_heartbeat_seconds`; server can re-rate | ✅ |
+| heartbeat | 703/755 | client heartbeats at `out_of_game_heartbeat_seconds`; server can re-rate | implemented |
 
 ## 3. Steam Guard MachineAuth flow (implemented)
 
@@ -219,8 +219,8 @@ it. (See `cm/machineauth.py:header()`.)
 
 | Feature | Evidence in binary | Gateway status |
 |---|---|---|
-| Steam Guard machine auth (all 6 messages) | confirmed | ✅ implemented + tested |
-| Login key (5463 / 5464) | confirmed | ✅ implemented + tested |
+| Steam Guard machine auth (all 6 messages) | confirmed | implemented + tested |
+| Login key (5463 / 5464) | confirmed | implemented + tested |
 | Content/download (depot manifests + chunks via `cs.steampowered.com`) | confirmed | bridge exists; URL/protocol specifics TBD by capture |
 | App info updates (`ClientAppInfoUpdate` 866) | confirmed constants | ignored (non-fatal) |
 | Library/license data (own-app list) | `ClientAccountInfo` | minimal persona sent; full license list TBD |

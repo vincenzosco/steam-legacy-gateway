@@ -1,5 +1,7 @@
 # steam-legacy-gateway
 
+[![CI](https://github.com/vincenzosco/steam-legacy-gateway/actions/workflows/ci.yml/badge.svg)](https://github.com/vincenzosco/steam-legacy-gateway/actions/workflows/ci.yml)
+
 A translating gateway that lets an **ancient Steam client** (2013-era, macOS Lion 10.7,
 Steam 1.0.x) talk to **modern Valve servers** — by sitting between them on a second,
 modern computer.
@@ -33,14 +35,14 @@ against packet captures from a real 2013 client:
 
 | Layer | Status | Notes |
 |---|---|---|
-| Hosts generation / routing | ✅ complete | `gateway/hosts.py`, `scripts/install_hosts.sh` |
-| TLS termination + HTTPS forwarding | ✅ complete | SNI routing, per-host certs, local CA; smoke-tested |
-| Content bridge (legacy URLs → depot cache) | ✅ complete | minimal HTTP origin + cache + fetcher |
-| Legacy CM framing + EMsg layer | ✅ complete | renumbered EMsg set (from the binary's own table), VT01 + proto-flag framing, unit-tested |
-| Steam Guard MachineAuth flow | ✅ complete | all 6 MachineAuth messages + NewLoginKey pair, job-id targeting, persistent sentry store, integration-tested end-to-end |
-| Modern back-end (ValvePython/steam) | ⚠️ complete code, needs your account | install `steam`, set credentials in config |
-| CM translator / message mapping | ✅ grounded | see [docs/PROTOCOL_ANALYSIS.md](docs/PROTOCOL_ANALYSIS.md) — channel encrypt + protobuf logon + post-logon set implemented from the binary + 2015-era SteamKit; the AES/session-key question is the remaining capture item |
-| Auth impersonation | ⚠️ structural only | the gateway owns the modern login; legacy session emulation is partial |
+| Hosts generation / routing | complete | `gateway/hosts.py`, `scripts/install_hosts.sh` |
+| TLS termination + HTTPS forwarding | complete | SNI routing, per-host certs, local CA; smoke-tested |
+| Content bridge (legacy URLs → depot cache) | complete | minimal HTTP origin + cache + fetcher |
+| Legacy CM framing + EMsg layer | complete | renumbered EMsg set (from the binary's own table), VT01 + proto-flag framing, unit-tested |
+| Steam Guard MachineAuth flow | complete | all 6 MachineAuth messages + NewLoginKey pair, job-id targeting, persistent sentry store, integration-tested end-to-end |
+| Modern back-end (ValvePython/steam) | complete; needs your account | install `steam`, set credentials in config |
+| CM translator / message mapping | grounded | see [docs/PROTOCOL_ANALYSIS.md](docs/PROTOCOL_ANALYSIS.md) — channel encrypt + protobuf logon + post-logon set implemented from the binary + 2015-era SteamKit; the AES/session-key question is the remaining capture item |
+| Auth impersonation | structural only | the gateway owns the modern login; legacy session emulation is partial |
 
 **Why the translator can't be finished blind:** the 2013 logon flow involved RSA-encrypted
 passwords against the CM public key and legacy key-value header fields that changed
@@ -48,7 +50,7 @@ frequently. EMsg values and struct layouts here are taken from SteamKit's public
 and SteamDatabase's tracked protobufs; exact 2013 behavior must be confirmed with packet
 captures from a real client before a real logon will complete.
 
-## ⚠️ Legal / account-risk disclaimer
+## Legal / account-risk disclaimer
 
 This project exists to research protocol translation. Using it violates the Steam
 Subscriber Agreement: automated or modified clients can get your account flagged or
