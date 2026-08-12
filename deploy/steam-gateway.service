@@ -1,0 +1,29 @@
+# steam-gateway.service — run the bridge 24/7 under systemd.
+#
+# Installed automatically by .github/workflows/deploy.yml, or manually:
+#   sudo cp deploy/steam-gateway.service /etc/systemd/system/
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now steam-gateway.service
+#
+# The gateway listens on TCP 27017-27020 (CM), 443/80 (TLS/plain) and 18081
+# (local content origin). Open the CM + TLS ports in the VM's firewall, e.g.:
+#   sudo ufw allow 27017:27020/tcp && sudo ufw allow 443/tcp && sudo ufw allow 80/tcp
+
+[Unit]
+Description=steam-legacy-gateway bridge
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/steam-legacy-gateway
+# The gateway owns the modern login (ValvePython/steam). Put credentials in
+# config/gateway.local.yaml (gitignored) before starting, or pass them as env:
+#   Environment=STEAM_USERNAME=you STEAM_PASSWORD=secret
+ExecStart=/opt/steam-legacy-gateway/.venv/bin/python -m gateway run
+Restart=always
+RestartSec=5
+NoNewPrivileges=true
+
+[Install]
+WantedBy=multi-user.target

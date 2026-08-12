@@ -1,0 +1,114 @@
+name: Deploy bridge (24/7)
+
+# Deploys the gateway to a persistent VM (bring-your-own server) and publishes
+# the host's public IP to deploy/endpoint.txt — the address you then hardcode
+# into the Steam client with scripts/patch_client.py.
+#
+# Why a VM and not a GitHub runner: GitHub-hosted runners are ephemeral (jobs
+# die after ~6h and accept no inbound TCP), so a 24/7 bridge must live on a
+# real server. This workflow is the "GitHub Actions" part: it ships the code,
+# keeps the service running, and writes the IP the client should use.
+#
+# Secrets to configure (Settings -> Secrets and variables -> Actions):
+#   DEPLOY_HOST     the VM's SSH hostname or IP
+#   DEPLOY_USER     SSH user (e.g. ubuntu, root)
+#   DEPLOY_SSH_KEY  private SSH key (ed25519 recommended)
+#   DEPLOY_PORT     SSH port (default 22)
+#
+# The VM must allow inbound TCP on the CM ports (27017-27020) and 443/80.
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "Branch/tag to deploy (default: main)"
+        required: false
+        default: "main"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: deploy-bridge
+  cancel-in-progress: true
+
+jobs:
+  deploy:
+    name: Deploy to ${{ vars.DEPLOY_HOST || 'VM' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.ref_name }}
+
+      - name: Write SSH key
+        run: |
+          mkdir -p ~/.ssh
+          echo "${{ secrets.DEPLOY_SSH_KEY }}" > ~/.ssh/id_deploy
+          chmod 600 ~/.ssh/id_deploy
+          ssh-keyscan -p ${{ secrets.DEPLOY_PORT || 22 }} \
+            ${{ secrets.DEPLOY_HOST }} >> ~/.ssh/known_hosts 2>/dev/null || true
+
+      - name: Ship code to the VM
+        run: |
+          rsync -az --delete -e "ssh -i ~/.ssh/id_deploy -p ${{ secrets.DEPLOY_PORT || 22 }} -o StrictHostKeyChecking=no" \
+            --exclude client --exclude content-cache --exclude certs --exclude .git --exclude .pytest_cache \
+            ./ ${{ secrets.DEPLOY_USER }}@${{ secrets.DEPLOY_HOST }}:/opt/steam-legacy-gateway/
+
+      - name: Install & start the service
+        run: |
+          ssh -i ~/.ssh/id_deploy -p ${{ secrets.DEPLOY_PORT || 22 }} -o StrictHostKeyChecking=no \
+            ${{ secrets.DEPLOY_USER }}@${{ secrets.DEPLOY_HOST }} 'bash -s' <<'EOF'
+          set -euo pipefail
+          cd /opt/steam-legacy-gateway
+          # python3.11+ (Ubuntu 22.04+ has 3.10; use python3.12 if available)
+          if command -v python3.12 >/dev/null 2>&1; then PY=python3.12; else PY=python3; fi
+          if [ ! -d .venv ]; then $PY -m venv .venv; fi
+          ./.venv/bin/pip install --upgrade pip >/dev/null
+          ./.venv/bin/pip install -r requirements.txt >/dev/null
+          # Generate the local CA + leaf bundle for the TLS forwarder (certs/
+          # is gitignored and excluded from rsync, so create it on the VM).
+          ./.venv/bin/python -m gateway gen-certs >/dev/null
+          # Install the systemd unit (start once, restart on reboot -> 24/7).
+          cp deploy/steam-gateway.service /etc/systemd/system/steam-gateway.service
+          systemctl daemon-reload
+          systemctl enable steam-gateway.service >/dev/null 2>&1 || true
+          systemctl restart steam-gateway.service
+          sleep 2
+          systemctl is-active steam-gateway.service
+          EOF
+
+      - name: Publish the public IP to deploy/endpoint.txt
+        run: |
+          IP=$(ssh -i ~/.ssh/id_deploy -p ${{ secrets.DEPLOY_PORT || 22 }} -o StrictHostKeyChecking=no \
+            ${{ secrets.DEPLOY_USER }}@${{ secrets.DEPLOY_HOST }} \
+            'curl -s --max-time 10 https://api.ipify.org || hostname -I | awk "{print \$1}"')
+          echo "bridge public IP: $IP"
+          mkdir -p deploy
+          printf '%s\n' "$IP" > deploy/endpoint.txt
+          if git diff --quiet deploy/endpoint.txt; then
+            echo "endpoint unchanged"
+          else
+            git config user.name "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git add deploy/endpoint.txt
+            git commit -m "Publish bridge endpoint: $IP"
+            git pull --rebase origin main || true
+            git push origin HEAD:main
+            echo "committed deploy/endpoint.txt = $IP"
+          fi
+
+      - name: Upload endpoint as artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: bridge-endpoint
+          path: deploy/endpoint.txt
+
+      - name: Deploy summary
+        run: |
+          echo "### Bridge deployed" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "Public IP: \`$(cat deploy/endpoint.txt 2>/dev/null || echo unknown)\`" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "Next: \`./scripts/patch_client.py --endpoint-file deploy/endpoint.txt\` to hardcode this IP into the Steam client." >> $GITHUB_STEP_SUMMARY

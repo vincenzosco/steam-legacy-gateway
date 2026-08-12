@@ -1,0 +1,147 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    name: Unit + integration tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          pip install --upgrade pip
+          pip install -r requirements.txt pytest pytest-asyncio
+
+      - name: Run test suite
+        run: python -m pytest tests/ -q
+
+      - name: Verify gateway CLI boots
+        run: |
+          python -m gateway routes
+          python -m gateway hosts --ip 203.0.113.7 | head -5
+
+  live-handshake:
+    # The real proof: boot the CM listener and run the Lion client simulator
+    # against it, exercising channel-encrypt + logon + Steam Guard MachineAuth.
+    name: Live handshake (gateway + simulator)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: |
+          pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Run end-to-end handshake with MachineAuth
+        run: |
+          python - <<'EOF'
+          import asyncio
+          from gateway.cm.server import run_cm_server
+          from gateway.cm.sim_client import run_handshake
+
+          class _Modern:
+              def is_ready(self):
+                  return True
+              def steam_id(self):
+                  return 76561197960265728
+
+          async def main():
+              cfg = {"cm": {"listen_ports": [0], "capture_dir": "",
+                            "sentry_store": ""},
+                     "account": {}, "gateway_ip": "127.0.0.1"}
+              servers = await run_cm_server(cfg, _Modern(), None)
+              port = servers[0].sockets[0].getsockname()[1]
+              res = await run_handshake("127.0.0.1", port, account="ciuser")
+              print(res.render_capture())
+              assert res.channel_result == 1, "channel encrypt refused"
+              assert res.logon_eresult == 1, "logon refused"
+              assert res.sentry_sha, "MachineAuth sentry exchange missing"
+              assert res.login_key_unique_id is not None, "login key missing"
+              print("E2E OK: channel=%s logon=%s sentry=%s login_key=%s" % (
+                  res.channel_result, res.logon_eresult,
+                  res.sentry_sha.hex()[:12], res.login_key_unique_id))
+              for s in servers:
+                  s.close()
+
+          asyncio.run(main())
+          EOF
+
+      - name: Upload handshake capture
+        uses: actions/upload-artifact@v4
+        with:
+          name: handshake-capture
+          path: /tmp/handshake*.txt
+        continue-on-error: true
+
+  patch-check:
+    # Validate the client-patching script against a synthetic binary so the
+    # GitHub Actions -> patch_client.py -> client path is tested without
+    # downloading the real 200 MB client on every push.
+    name: Client patch script sanity check
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Build a fake steamclient.dylib and patch it
+        run: |
+          python - <<'EOF'
+          import shutil, subprocess, sys
+          from pathlib import Path
+
+          fake = Path("client/Steam.app/Contents/MacOS/steamclient.dylib")
+          fake.parent.mkdir(parents=True, exist_ok=True)
+          table = b"".join(
+              f"208.64.200.{200+i}:27017\0".encode() for i in range(5)
+          ) + b"".join(
+              f"208.64.200.{200+i}:27018\0".encode() for i in range(5)
+          ) + b"\0" * 64
+          fake.write_bytes(table)
+
+          out = subprocess.run(
+              [sys.executable, "scripts/patch_client.py", "--verify"],
+              capture_output=True, text=True)
+          print(out.stdout)
+          # pristine multi-IP table -> WARN + exit 1 (not patched yet)
+          assert out.returncode == 1, out.stdout + out.stderr
+          assert "WARN" in out.stdout, out.stdout
+
+          out = subprocess.run(
+              [sys.executable, "scripts/patch_client.py", "--ip", "203.0.113.7"],
+              capture_output=True, text=True)
+          print(out.stdout)
+          assert "patched" in out.stdout
+
+          out = subprocess.run(
+              [sys.executable, "scripts/patch_client.py", "--verify",
+               "--expect", "203.0.113.7"],
+              capture_output=True, text=True)
+          print(out.stdout)
+          assert out.returncode == 0, out.stdout + out.stderr
+          assert "all 10 CM slots point at 203.0.113.7" in out.stdout
+          print("patch-client OK")
+          EOF

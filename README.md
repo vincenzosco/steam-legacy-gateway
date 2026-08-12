@@ -55,6 +55,30 @@ Subscriber Agreement: automated or modified clients can get your account flagged
 banned. **Use at your own risk, ideally with an alt account.** Valve can break any part
 of this server-side at any time — that's inherent to the approach.
 
+## Hosting the bridge 24/7 + hardcoding it into the client
+
+**GitHub Actions can't host a long-running TCP server** (runners are ephemeral
+and accept no inbound connections), but it makes an excellent orchestrator:
+
+- **CI** (`.github/workflows/ci.yml`) — runs the test suite plus a **live
+  gateway → simulator handshake** (channel encrypt + logon + Steam Guard
+  MachineAuth) on every push/PR.
+- **Deploy** (`.github/workflows/deploy.yml`) — ships the bridge to a VM you
+  control, runs it under systemd (`Restart=always`, survives reboot), then
+  publishes the VM's public IP to `deploy/endpoint.txt` — *the* address.
+- **Client patch** (`scripts/patch_client.py`) — rewrites the Steam client's
+  built-in CM server list in place so it connects straight to that IP:
+  ```bash
+  ./scripts/patch_client.py --endpoint-file deploy/endpoint.txt   # IP from GH Actions
+  ./scripts/patch_client.py --dry-run --ip 203.0.113.7            # preview
+  ./scripts/patch_client.py --verify --expect 203.0.113.7         # confirm (exit 0 only if fully patched)
+  ./scripts/patch_client.py --restore                             # revert
+  ```
+  No `/etc/hosts` edit needed for the CM layer — the hardcoded addresses are
+  what the client tries first (and they bypass DNS entirely).
+
+Full deployment guide: [`docs/DEPLOY.md`](docs/DEPLOY.md).
+
 ## Setup
 
 Full, end-to-end setup is in [`docs/SETUP.md`](docs/SETUP.md) — gateway machine, Lion machine,
