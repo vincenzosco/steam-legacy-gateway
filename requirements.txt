@@ -1,0 +1,8 @@
+# --- Core (required) -----------------------------------------------------
+PyYAML>=6.0
+cryptography>=42.0
+
+# --- Modern CM back-end (optional but recommended) -----------------------
+# ValvePython/steam implements the modern Steam client protocol + auth.
+# The gateway degrades gracefully (offline skeleton mode) if this is absent.
+steam>=1.4.4

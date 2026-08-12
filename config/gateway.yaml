@@ -1,0 +1,42 @@
+# steam-legacy-gateway configuration
+# Copy this file to config/gateway.local.yaml and edit.
+
+# IP address the Lion machine will use to reach this gateway
+# (set from `ifconfig` / router DHCP reservation on the gateway machine)
+gateway_ip: 192.168.1.50
+
+# --- TLS forwarder --------------------------------------------------------
+tls:
+  listen_port: 443
+  plain_port: 80
+  cert_dir: certs
+  # CA cert that must be installed & trusted on the Lion machine
+  ca_cert: certs/steam-gateway-ca.crt
+  ca_key: certs/steam-gateway-ca.key
+
+# --- Legacy CM (Connection Manager) listener ------------------------------
+cm:
+  listen_ports: [27017, 27018, 27019, 27020]
+  # If blank, the gateway resolves CM hostnames itself; otherwise pin here.
+  modern_cm_host: ""
+
+# --- Modern account (the gateway owns this login) --------------------------
+account:
+  username: ""
+  password: ""
+  # Leave empty to be prompted interactively for a Steam Guard code.
+  steam_guard: ""
+
+# --- Content bridge ---------------------------------------------------------
+content:
+  cache_dir: content-cache
+  listen_port: 18081            # local-only origin (reached through the TLS proxy)
+  # Path to DepotDownloader (SteamRE). If unset, the bridge tries ValvePython CDN
+  # then reports the command you need to run manually.
+  depot_downloader_path: ""
+  # Optional: prepopulate these so the old client's requests can be served.
+  #   preload: [{appid: 220, depot: 221}]
+  preload: []
+
+# --- Logging -----------------------------------------------------------------
+log_level: INFO

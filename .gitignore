@@ -1,0 +1,13 @@
+# Generated secrets — never commit
+certs/
+
+# Local config with real credentials (copy config/gateway.yaml to this name)
+config/gateway.local.yaml
+
+# Runtime data
+content-cache/
+
+# Python
+__pycache__/
+*.pyc
+.venv/
