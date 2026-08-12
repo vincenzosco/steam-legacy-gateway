@@ -33,7 +33,8 @@ def _logging_setup(level: str) -> None:
     )
 
 
-async def _run_services(cfg: dict, *, run_cm: bool, run_content: bool) -> None:
+async def _run_services(cfg: dict, *, run_cm: bool, run_content: bool,
+                        run_tls: bool) -> None:
     from gateway.cm.server import run_cm_server
     from gateway.content.bridge import ContentBridge
     from gateway.content.cache import ChunkCache
@@ -76,12 +77,13 @@ async def _run_services(cfg: dict, *, run_cm: bool, run_content: bool) -> None:
         log.warning("No account configured — CM translator will refuse logons. "
                     "Set account.* in config/gateway.local.yaml")
 
-    servers.extend(await run_tls_proxy(cfg, stop))
+    if run_tls:
+        servers.extend(await run_tls_proxy(cfg, stop))
     if run_cm:
         if modern is None:
-            log.warning("--no-modern (no account) but CM listener requested; "
-                        "starting it anyway (logons will fail).")
-        servers.extend(await run_cm_server(cfg, modern, stop) if modern else [])
+            log.warning("No modern session (no account configured) — CM listener "
+                        "starts anyway, but legacy logons will be refused.")
+        servers.extend(await run_cm_server(cfg, modern, stop))
 
     log.info("gateway ready. Point the Lion machine's hosts file at %s",
              cfg.get("gateway_ip", "?"))
@@ -139,6 +141,8 @@ def main(argv: list[str] | None = None) -> int:
     p_run = sub.add_parser("run")
     p_run.add_argument("--no-cm", action="store_true", help="skip CM listener")
     p_run.add_argument("--no-content", action="store_true", help="skip content origin")
+    p_run.add_argument("--cm-only", action="store_true",
+                       help="only the CM listener (no root needed; for the client simulator)")
 
     sub.add_parser("gen-certs")
 
@@ -199,8 +203,12 @@ def main(argv: list[str] | None = None) -> int:
 
         return asyncio.run(_smoke())
 
-    return asyncio.run(_run_services(cfg, run_cm=not args.no_cm,
-                                     run_content=not args.no_content))
+    return asyncio.run(_run_services(
+        cfg,
+        run_cm=not args.no_cm,
+        run_content=not args.no_content and not args.cm_only,
+        run_tls=not args.cm_only,
+    ))
 
 
 if __name__ == "__main__":

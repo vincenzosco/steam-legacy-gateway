@@ -85,14 +85,24 @@ key with the gateway's own (a single well-defined patch — the gateway's README
 honesty section should be updated accordingly). This is the single most
 important unknown.
 
+✅ **Verified by the gateway's client simulator** (`gateway/cm/sim_client.py`,
+`tests/test_handshake_integration.py`): the gateway accepts this exact response
+layout and answers `ChannelEncryptResult` eresult=1; the full exchange —
+including the protobuf logon and the 940 response — runs end-to-end and is
+captured byte-for-byte. See the capture transcript below in §4.
+
 ### 2.3 Logon
 
-- The 2015 client sends **protobuf `ClientLogon`** (`EMsg 704 | 0x80000000`,
-  VT01 framing, `CMsgClientLogon`: account_name, password RSA-OAEP-encrypted,
+- The 2015 client sends **protobuf `ClientLogon`** (VT01 framing,
+  `CMsgClientLogon`: account_name, password RSA-OAEP-encrypted,
   protocol_version, client_os_type, client_language, machine_id, …) — **not** the
   pre-2013 binary `MsgClientLogon`. The gateway's `_LegacyLogon` parser targets
   the binary layout — replaced by a minimal protobuf field walk (account_name =
   field 1).
+- **Wire detail (from the simulator capture):** protobuf messages carry the
+  *plain* EMsg (e.g. `704`, bytes `c0 02 00 00`) with the VT01 magic + header
+  length — **not** the `0x80000000` proto flag SteamKit sets in memory. The
+  gateway's framing matches this.
 - No `ClientHello` string exists in this build — it predates it. The client goes
   straight from channel encryption to `ClientLogon`.
 
@@ -122,7 +132,31 @@ and the binary's message constants:
 | Game launch → session tickets (`ClientGamesPlayed`, game-server tickets) | confirmed | missing — multiplayer/owned-server auth won't work |
 | Store/community rendering | `chromehtml.dylib` (old WebKit) | dead end — modern storefront won't render; unchanged |
 
-## 4. What a capture must confirm (verification plan)
+## 4. Capture tooling (what exists now)
+
+- **`gateway/cm/sim_client.py` / `scripts/client_sim.py`** — a protocol-accurate
+  stand-in for the Lion-era client. Run it against the live gateway to capture
+  the full handshake without needing a 32-bit machine:
+  ```bash
+  python3 -m gateway run --cm-only          # terminal 1: gateway, no root needed
+  python3 scripts/client_sim.py --out captures/handshake.txt   # terminal 2
+  ```
+  Every frame is hexdumped with direction (`<` server→client, `>` client→server)
+  and annotated with the message name.
+- **Gateway capture mode** — set `cm.capture_dir: captures/` in the config and
+  every connection's raw bytes are written to `captures/conn-*.bin` (outbound
+  prefixed `>`, inbound `<`). When you run the *real* client on the Lion Mac,
+  those files are the ground truth.
+
+### Verified so far (simulator)
+
+The channel-encrypt exchange runs end-to-end and matches the documented layout:
+`ChannelEncryptRequest` (challenge) → `ChannelEncryptResponse`
+(`[proto v1][key_size 128][key][crc32][end_flag]`) → `ChannelEncryptResult`
+(eresult=1) → protobuf `ClientLogon` → `ClientLogOnResponse` (940). See
+`tests/test_handshake_integration.py` and the capture below.
+
+## 5. What a capture must confirm (verification plan)
 
 1. **Framing of the 3 handshake packets** (struct with job IDs vs plain).
 2. **Channel-encrypt direction + session-key encryption** — is the key pinned
@@ -137,7 +171,7 @@ Method: run the client on the Lion machine with the gateway's CM listener
 pointing at a packet-capture mode (`tcpdump` on the gateway host, or a debug
 dump mode in `cm/server.py`), then map bytes → messages.
 
-## 5. Sources
+## 6. Sources
 
 - Binary: Macintosh Garden `Steam_MacOS_X_10.6_Snow_Leopard.zip` (extracted client)
 - SteamKit2: `Steam/CMClient.cs` (master + tag 2.5.0), `Steam/Messages/*`

@@ -8,6 +8,9 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import struct
+import time
+from pathlib import Path
 from typing import Any
 
 from gateway.cm.framing import FramingError, read_frame
@@ -17,9 +20,49 @@ from gateway.cm.translator import TranslatorSession
 log = logging.getLogger("gateway.cm.server")
 
 
+class _CaptureWriter:
+    """Wraps a StreamWriter and tees outbound bytes into a capture file.
+
+    Outbound bytes are prefixed with ">", inbound with "<" (see _handle_conn).
+    The file is flushed after every write so a crash never loses a handshake.
+    """
+
+    def __init__(self, inner: asyncio.StreamWriter, fh):
+        self._inner = inner
+        self._fh = fh
+
+    def write(self, data: bytes) -> None:
+        self._fh.write(b">" + data)
+        self._fh.flush()
+        self._inner.write(data)
+
+    async def drain(self) -> None:
+        await self._inner.drain()
+
+    def close(self) -> None:
+        try:
+            self._inner.close()
+        except Exception:
+            pass
+
+
+def _open_capture(capture_dir: str, peer) -> object | None:
+    if not capture_dir:
+        return None
+    Path(capture_dir).mkdir(parents=True, exist_ok=True)
+    stamp = f"{int(time.time() * 1000)}"
+    fname = f"conn-{stamp}-{peer[0]}-{peer[1]}.bin"
+    fh = (Path(capture_dir) / fname).open("wb")
+    log.info("capturing connection bytes to %s", fname)
+    return fh
+
+
 async def _handle_conn(reader: asyncio.StreamReader, writer: asyncio.StreamWriter,
-                       cfg: dict, modern: ModernSession) -> None:
+                       cfg: dict, modern: ModernSession | None) -> None:
     peer = writer.get_extra_info("peername")
+    capture_fh = _open_capture(cfg["cm"].get("capture_dir", "") or "", peer)
+    if capture_fh is not None:
+        writer = _CaptureWriter(writer, capture_fh)
     session = TranslatorSession(writer, cfg, modern)
     log.info("legacy CM connection from %s", peer)
     try:
@@ -38,6 +81,10 @@ async def _handle_conn(reader: asyncio.StreamReader, writer: asyncio.StreamWrite
                 break
             if frame is None:
                 break
+            if capture_fh is not None:
+                # Rebuild the exact wire bytes: 4-byte length prefix + payload.
+                capture_fh.write(b"<" + struct.pack("<I", len(frame.raw)) + frame.raw)
+                capture_fh.flush()
             await session.handle(frame)
     except (ConnectionResetError, BrokenPipeError):
         pass
@@ -47,6 +94,8 @@ async def _handle_conn(reader: asyncio.StreamReader, writer: asyncio.StreamWrite
         log.exception("CM handler error for %s", peer)
     finally:
         await session.close()
+        if capture_fh is not None:
+            capture_fh.close()
         log.info("legacy CM connection from %s closed", peer)
 
 

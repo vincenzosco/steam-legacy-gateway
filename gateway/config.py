@@ -15,7 +15,11 @@ LOCAL_PATH = PROJECT_ROOT / "config" / "gateway.local.yaml"
 DEFAULTS: dict[str, Any] = {
     "gateway_ip": "192.168.1.50",
     "tls": {"listen_port": 443, "plain_port": 80, "cert_dir": "certs"},
-    "cm": {"listen_ports": [27017, 27018, 27019, 27020], "modern_cm_host": ""},
+    "cm": {
+        "listen_ports": [27017, 27018, 27019, 27020],
+        "modern_cm_host": "",
+        "capture_dir": "",  # set to e.g. captures/ to log every connection's raw bytes
+    },
     "account": {"username": "", "password": "", "steam_guard": ""},
     "content": {
         "cache_dir": "content-cache",

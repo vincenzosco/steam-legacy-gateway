@@ -132,9 +132,17 @@ Notes:
 ## Testing
 
 ```bash
-python -m pytest tests/ -q        # unit tests (framing, routing, hosts, mini-http)
+python -m pytest tests/ -q        # unit + in-process handshake integration tests
 scripts/smoke_tls.sh              # end-to-end TLS forwarding check (needs network)
+
+# protocol-accurate client simulation (no Lion machine needed):
+python3 -m gateway run --cm-only  &              # terminal 1: gateway, no root needed
+python3 scripts/client_sim.py --out captures/handshake.txt   # terminal 2: the client
 ```
+
+For a capture of the *real* client later, set `cm.capture_dir: captures/` in the
+config — every connection's raw bytes are written to `captures/conn-*.bin`.
+See [docs/PROTOCOL_ANALYSIS.md §4](docs/PROTOCOL_ANALYSIS.md#4-capture-tooling-what-exists-now).
 
 ## Project layout
 
