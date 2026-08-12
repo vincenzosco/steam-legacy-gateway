@@ -28,8 +28,11 @@ FORWARD_HOSTS: dict[str, str] = {
     "client-update.akamaihd.net": "client-update.akamaihd.net",
 }
 
-# Legacy content hosts -> the local content origin (serves from the depot cache).
+# Content hosts -> the local content origin (serves from the depot cache).
+# cs.steampowered.com is the content-server host this Oct-2015 client actually
+# uses (confirmed in the binary); steampipe/cacheN cover other eras.
 LOCAL_ORIGIN_HOSTS: set[str] = {
+    "cs.steampowered.com",
     "steampipe.akamaized.net",
     "steamcontent.com",
     "edgecast.steamcontent.com",

@@ -29,7 +29,9 @@ ClientSetHeartbeatRate = 718
 ClientGamesPlayed = 720
 
 # --- Protobuf-era equivalents (VT01 framing) ---------------------------------
+# Confirmed in the Oct-2015 client binary (k_EMsgClient* strings) + SteamKit.
 ClientLogOnResponse = 940
+ClientSessionToken = 761
 ClientCMList = 762
 ClientUpdateAppInfo = 745
 

@@ -1,25 +1,37 @@
 """Legacy <-> modern CM message translator.
 
-Session state machine per legacy TCP connection:
+Session state machine per legacy TCP connection (server = us, client = the
+2015-era Steam app):
 
-    AWAIT_ENCRYPT -> CHANNEL_OPEN -> AWAIT_LOGON -> AUTHENTICATING -> ACTIVE
-                        (130/131/132)      (704)          (modern    (heartbeats,
-                                                          login)      games, etc.)
+    AWAIT_ENCRYPT -> CHANNEL_OPEN -> AWAIT_LOGON -> ACTIVE
+        (we send 130,          (client sends    (protobuf
+         client replies 131,    protobuf 704,    logon response
+         we send 132)            we reply 940)    + heartbeat loop)
 
-The 2013 client speaks legacy binary messages (EMsg <= ~720) and VT01 protobuf
-messages (940+). Modern Valve servers speak only the modern protocol, so this
-translator terminates the legacy side and drives the modern side through
-`ModernSession` (ValvePython/steam).
+The analysis in docs/PROTOCOL_ANALYSIS.md (grounded in the actual binary +
+SteamKit2 + steamkit-python) establishes:
 
-HONESTY NOTE: the exact wire layouts of the 2013 logon handshake (RSA key
-exchange via ChannelEncrypt* and the MsgClientLogon fields) must be verified
-against packet captures from a real Lion-era client. The parsing below follows
-SteamKit's public sources; fields marked TODO-VERIFY need capture confirmation.
+  * the channel-encrypt handshake is SERVER-INITIATED (we send
+    ChannelEncryptRequest with a challenge; the client replies
+    ChannelEncryptResponse with its AES session key; we confirm with
+    ChannelEncryptResult). Earlier code had this backwards.
+  * the client logs in with the PROTOBUF ClientLogon (EMsg 704 | proto flag)
+    and expects the protobuf ClientLogOnResponse (940) + ClientSessionToken
+    (761), not the pre-2013 binary logon response.
+  * post-handshake payloads are AES-encrypted with the session key. Whether we
+    can decrypt it (server-provided key vs key embedded in the client) is the
+    open question — see docs/PROTOCOL_ANALYSIS.md §2.2. Until then we store the
+    encrypted key blob for capture comparison.
+
+VERIFY-BY-CAPTURE notes: exact handshake framing (struct-in-VT01 vs legacy),
+protobuf header field numbers, and the AES scheme are marked inline.
 """
 from __future__ import annotations
 
 import asyncio
+import gzip
 import logging
+import os
 import struct
 from enum import Enum
 
@@ -27,82 +39,44 @@ from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric import rsa
 
 from gateway.auth.bridge import Credentials, credentials_from_config
-from gateway.cm import emsg
-from gateway.cm.framing import Frame, encode_legacy, encode_proto
+from gateway.cm import emsg, proto
+from gateway.cm.framing import Frame, decode_frame, encode_handshake, encode_legacy, encode_proto
 from gateway.cm.modern import ModernSession
 
 log = logging.getLogger("gateway.cm.translator")
 
-PROTOCOL_VERSION_2013 = 17  # typical for the 2013-era client (see captures)
+# Protocol version the gateway announces in ChannelEncryptRequest.
+# TODO-VERIFY: exact value expected by the 2015 client (capture).
+CHANNEL_PROTOCOL_VERSION = 1
+
+CHALLENGE_LEN = 16  # per steamkit-python wire docs: 16-byte challenge
 
 
 class State(str, Enum):
-    AWAIT_ENCRYPT = "await_encrypt"
-    CHANNEL_OPEN = "channel_open"
+    AWAIT_ENCRYPT = "await_encrypt"  # we sent 130, awaiting client's 131
+    CHANNEL_OPEN = "channel_open"    # client's 131 accepted, we sent 132
     AWAIT_LOGON = "await_logon"
     AUTHENTICATING = "authenticating"
     ACTIVE = "active"
 
 
-class _LegacyLogon:
-    """Best-effort parser for the 2013-era MsgClientLogon body.
+class _ProtoLogon:
+    """Minimal CMsgClientLogon reader (protobuf).
 
-    Layout (after the 4-byte EMsg), per SteamKit's MsgClientLogon serialization:
-
-        ProtocolVersion : int32
-        ClientOsType    : uint32
-        ClientLanguage  : uint32
-        ClientAppId     : uint32
-        Unicode         : byte
-        SupportsNewLogin: byte
-        MachineId       : uint32 len + bytes
-        SteamID         : uint64
-        AccountName     : int16 len + utf8
-        Password        : int16 len + bytes   (RSA-encrypted)
-        ... (login key / remember / sentinel flags follow)
-
-    TODO-VERIFY: the 2013 wire format likely used an ExtendedClientMsgHdr
-    (SteamID u64 + SessionID u32 between the EMsg and the body), which would
-    shift every offset here by 12 bytes. Confirm with captures before relying
-    on field offsets — the parser is lenient on failure by design.
+    CMsgClientLogon (SteamDatabase protobufs): account_name = 1 (string),
+    password = 2 (bytes, RSA-encrypted), protocol_version = 3, client_os_type = 4,
+    client_language = 5, machine_id = 8 (bytes) ...
+    Only account_name is needed by the gateway (the modern session owns the
+    real login). VERIFY-BY-CAPTURE: field numbers.
     """
 
     def __init__(self, body: bytes):
         self.body = body
-        self.protocol_version = 0
-        self.username = ""
-        self.password_encrypted = b""
-
-    def parse(self) -> bool:
-        try:
-            off = 0
-            (self.protocol_version,) = struct.unpack_from("<i", self.body, off); off += 4
-            off += 4 * 3  # ClientOsType, ClientLanguage, ClientAppId
-            off += 2      # Unicode, SupportsNewLogin
-            (mach_len,) = struct.unpack_from("<I", self.body, off); off += 4
-            off += mach_len
-            off += 8      # SteamID
-            self.username = self._read_string(off)
-            off += 2 + len(self.username.encode("utf-8"))
-            self.password_encrypted = self._read_bytes(off)
-            return True
-        except (struct.error, IndexError):
-            log.warning("could not parse legacy ClientLogon body "
-                        "(%d bytes) - layout may differ from SteamKit docs", len(self.body))
-            return False
-
-    def _read_string(self, off: int) -> str:
-        (n,) = struct.unpack_from("<H", self.body, off)
-        return self.body[off + 2: off + 2 + n].decode("utf-8", errors="replace")
-
-    def _read_bytes(self, off: int) -> bytes:
-        (n,) = struct.unpack_from("<H", self.body, off)
-        return self.body[off + 2: off + 2 + n]
+        self.account_name = proto.field_text(1, body) or ""
+        self.password_encrypted = proto.field_bytes(2, body) or b""
 
 
-# In the real protocol the CM serves one fixed RSA key for password
-# encryption; share a single key across sessions instead of generating one per
-# connection. (Placeholder until the 2013 key-exchange format is captured.)
+# The real CM serves one fixed RSA key; share a single key across sessions.
 _server_rsa_key: rsa.RSAPrivateKey | None = None
 
 
@@ -117,19 +91,28 @@ class TranslatorSession:
     """One legacy CM connection, translated onto the shared modern session."""
 
     def __init__(self, writer: asyncio.StreamWriter, cfg: dict,
-                 modern: ModernSession):
+                 modern: ModernSession | None):
         self.writer = writer
         self.cfg = cfg
         self.modern = modern
         self.state = State.AWAIT_ENCRYPT
         self.steam_id = 0
-        self._rsa_key = _server_key()
+        self.session_id = 1
+        self.session_token = os.urandom(8).hex()
+        self._client_session_key_encrypted = b""
 
     # -- public ----------------------------------------------------------------
 
+    async def start_handshake(self) -> None:
+        """Server-initiated channel encryption: send ChannelEncryptRequest(130)."""
+        challenge = os.urandom(CHALLENGE_LEN)
+        self.writer.write(encode_handshake(emsg.ChannelEncryptRequest, challenge))
+        await self.writer.drain()
+        log.debug("sent ChannelEncryptRequest (challenge %d bytes)", len(challenge))
+
     async def handle(self, frame: Frame) -> None:
-        log.debug("[%s] %s (proto=%s, %d bytes)", self.state.value, frame.name,
-                  frame.proto, len(frame.raw))
+        log.debug("[%s] %s (proto=%s struct=%s, %d bytes)", self.state.value,
+                  frame.name, frame.proto, frame.struct, len(frame.raw))
 
         if frame.emsg == emsg.Multi:
             await self._handle_multi(frame)
@@ -145,26 +128,41 @@ class TranslatorSession:
 
     # -- channel encryption handshake ------------------------------------------
 
-    async def _on_ChannelEncryptRequest(self, frame: Frame) -> None:
+    async def _on_ChannelEncryptResponse(self, frame: Frame) -> None:
         if self.state != State.AWAIT_ENCRYPT:
-            log.warning("unexpected ChannelEncryptRequest in %s", self.state.value)
+            log.warning("unexpected ChannelEncryptResponse in %s", self.state.value)
             return
-        pub = self._rsa_key.public_key().public_bytes(
-            encoding=serialization.Encoding.DER,
-            format=serialization.PublicFormat.SubjectPublicKeyInfo,
+        body = frame.body
+        if len(body) < 16:
+            log.warning("ChannelEncryptResponse too short (%d bytes)", len(body))
+            return
+        # [protocol_version:4][key_size:4][encrypted_session_key:keysize][crc32:4][end_flag:4]
+        protocol_version, key_size = struct.unpack_from("<ii", body, 0)
+        key = body[8:8 + key_size]
+        crc = struct.unpack_from("<I", body, 8 + key_size)[0] if len(body) >= 12 + key_size else 0
+        self._client_session_key_encrypted = key
+        log.info(
+            "client channel encrypt response: proto v%d, key_size %d, crc %08x, %d bytes",
+            protocol_version, key_size, crc, len(body),
         )
-        # ChannelEncryptResponse: [emsg:4][pubkey_len:4][pubkey DER][...]
-        # TODO-VERIFY: exact 2013 layout (modulus/exponent vs DER) per captures.
-        body = struct.pack("<I", len(pub)) + pub
-        await self._send_legacy(emsg.ChannelEncryptResponse, body)
+        # TODO-VERIFY: decrypt `key` with our private key once the key story is
+        # resolved (docs/PROTOCOL_ANALYSIS.md §2.2). The client encrypts it with
+        # *something* — embedded Steam key or a server-provided key — and that
+        # determines whether a pure MITM can read post-handshake traffic.
+        # We store it so a capture can be compared byte-for-byte.
+        result = struct.pack("<i", 1)  # EResult.OK
+        self.writer.write(encode_handshake(emsg.ChannelEncryptResult, result))
+        await self.writer.drain()
+        self.state = State.CHANNEL_OPEN
+        log.info("channel encrypted (channel_open)")
+
+    async def _on_ChannelEncryptRequest(self, frame: Frame) -> None:
+        # A legacy-era client would only send this if it expected to initiate;
+        # the 2015 client waits for ours (start_handshake). Log it defensively.
+        log.warning("client sent ChannelEncryptRequest (unexpected for this era)")
 
     async def _on_ChannelEncryptResult(self, frame: Frame) -> None:
-        (result,) = struct.unpack_from("<I", frame.body, 0) if len(frame.body) >= 4 else (0,)
-        if result == 1:
-            self.state = State.CHANNEL_OPEN
-            log.info("legacy channel encrypted (state=channel_open)")
-        else:
-            log.warning("legacy ChannelEncryptResult != 1 (%d)", result)
+        log.warning("client sent ChannelEncryptResult (unexpected for this era)")
 
     # -- logon -----------------------------------------------------------------
 
@@ -172,50 +170,51 @@ class TranslatorSession:
         if self.state not in (State.CHANNEL_OPEN, State.AWAIT_LOGON):
             log.warning("ClientLogon in unexpected state %s", self.state.value)
             return
-        logon = _LegacyLogon(frame.body)
-        parsed = logon.parse()
+        logon = _ProtoLogon(frame.body)
         self.state = State.AUTHENTICATING
-        if not parsed:
+
+        if not logon.account_name:
+            log.warning("protobuf ClientLogon without account_name "
+                        "(%d bytes) — field numbers may differ", len(frame.body))
             await self._send_logon_failure("logon parse failed")
             return
 
-        # The gateway already owns a modern session (started at boot). Only let
-        # the legacy logon through if the modern login actually succeeded — a
-        # failed modern login (bad guard code, etc.) must refuse the legacy side.
-        if not self.modern.is_ready():
+        if not (self.modern and self.modern.is_ready()):
             await self._send_logon_failure("modern session not ready")
             return
 
-        log.info("legacy logon for %r (proto v%d, pw len %d)",
-                 logon.username, logon.protocol_version, len(logon.password_encrypted))
-        # TODO-VERIFY: decrypt password_encrypted with self._rsa_key once the
-        # exact encryption (PKCS1v15 vs OAEP, key selection) is confirmed, and
-        # cross-check the account against the modern session's account.
-        self.steam_id = 0
+        log.info("legacy logon for %r (password %d bytes, proto msg %d bytes)",
+                 logon.account_name, len(logon.password_encrypted), len(frame.body))
         self.state = State.ACTIVE
         await self._send_logon_success()
 
     async def _send_logon_success(self) -> None:
-        # Legacy ClientLogonResponse body (best-effort, per SteamKit):
-        #   [emsg:4][session_id:4][steam_id:8][eresult:4][...]
-        body = struct.pack("<iQi", 1, self.steam_id, 1)  # session, steamid, EResult.OK
-        await self._send_legacy(emsg.ClientLogonResponse, body)
-        log.info("legacy session ACTIVE (session %d)", 1)
+        # Protobuf ClientLogOnResponse (940): header carries client_steam_id (1)
+        # + client_session_id (2); body eresult (1) = EResult.OK.
+        header = (
+            proto.fixed64_field(1, self.steam_id)
+            + proto.varint_field(2, self.session_id)
+        )
+        body = proto.varint_field(1, 1)  # EResult.OK
+        await self._send_proto(emsg.ClientLogOnResponse, header, body)
+        # ClientSessionToken (761): token (1, uint64).
+        await self._send_proto(emsg.ClientSessionToken, b"",
+                               proto.varint_field(1, int(self.session_token, 16)))
+        log.info("legacy session ACTIVE (steamid %d, session %d)", self.steam_id,
+                 self.session_id)
 
     async def _send_logon_failure(self, reason: str) -> None:
-        body = struct.pack("<iQi", 0, 0, 3)  # EResult=3 (InvalidPassword) placeholder
-        await self._send_legacy(emsg.ClientLogonResponse, body)
+        body = proto.varint_field(1, 3)  # EResult.InvalidPassword placeholder
+        await self._send_proto(emsg.ClientLogOnResponse, b"", body)
         log.warning("legacy logon refused: %s", reason)
 
     # -- heartbeat / keepalive -------------------------------------------------
 
     async def _on_ClientHeartBeat(self, frame: Frame) -> None:
-        # The 2013 server responded to heartbeats with ClientHeartBeat only when
-        # the rate needed changing; silence is normal. TODO-VERIFY.
         log.debug("heartbeat")
 
     async def _on_ClientNewLoginKey(self, frame: Frame) -> None:
-        # Client proposes a login key; server usually accepts it.
+        # Client proposes a login key (712); server usually accepts it (713).
         await self._send_legacy(emsg.ClientNewLoginKeyAccepted, b"")
 
     async def _on_ClientSetHeartbeatRate(self, frame: Frame) -> None:
@@ -232,20 +231,27 @@ class TranslatorSession:
     # -- plumbing --------------------------------------------------------------
 
     async def _handle_multi(self, frame: Frame) -> None:
-        from gateway.cm.framing import decode_frame, FramingError
-
-        body = frame.body
-        while body:
+        # CMsgMulti (protobuf): message_body = 1 (bytes), size_unzipped = 2 (varint).
+        # When size_unzipped > 0 the body is gzip-compressed (SteamKit 2.5.0).
+        payload = proto.field_bytes(1, frame.body) or b""
+        size_unzipped = proto.field_varint(2, frame.body)
+        if size_unzipped > 0:
             try:
-                nested = decode_frame(body)
-            except FramingError as exc:
+                payload = gzip.decompress(payload)
+            except (OSError, EOFError) as exc:
+                log.warning("Multi gzip decompress failed: %s", exc)
+                return
+        while payload:
+            try:
+                nested = decode_frame(payload)
+            except Exception as exc:
                 log.warning("bad nested frame in Multi: %s", exc)
                 break
-            body = body[len(nested.raw):]
+            payload = payload[len(nested.raw):]
             await self.handle(nested)
 
     async def _unmapped(self, frame: Frame) -> None:
-        # Register mappings here as the protocol is verified (see README status).
+        # Register mappings here as the protocol is verified (docs/PROTOCOL_ANALYSIS.md).
         pass
 
     async def _send_legacy(self, emsg_id: int, body: bytes) -> None:

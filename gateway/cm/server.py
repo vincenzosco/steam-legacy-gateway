@@ -23,6 +23,8 @@ async def _handle_conn(reader: asyncio.StreamReader, writer: asyncio.StreamWrite
     session = TranslatorSession(writer, cfg, modern)
     log.info("legacy CM connection from %s", peer)
     try:
+        # Server-initiated channel encryption: send ChannelEncryptRequest(130).
+        await session.start_handshake()
         while True:
             try:
                 frame = await asyncio.wait_for(read_frame(reader), timeout=180)

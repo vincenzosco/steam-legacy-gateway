@@ -36,9 +36,9 @@ against packet captures from a real 2013 client:
 | Hosts generation / routing | ✅ complete | `gateway/hosts.py`, `scripts/install_hosts.sh` |
 | TLS termination + HTTPS forwarding | ✅ complete | SNI routing, per-host certs, local CA; smoke-tested |
 | Content bridge (legacy URLs → depot cache) | ✅ complete | minimal HTTP origin + cache + fetcher |
-| Legacy CM framing + EMsg layer | ✅ complete | `VT01` protobuf framing + legacy framing, unit-tested |
+| Legacy CM framing + EMsg layer | ✅ complete | `VT01` protobuf + struct-in-VT01 handshake framing, unit-tested |
 | Modern back-end (ValvePython/steam) | ⚠️ complete code, needs your account | install `steam`, set credentials in config |
-| CM translator / message mapping | ⚠️ skeleton, needs protocol verification | registry in `cm/translator.py` |
+| CM translator / message mapping | ⚠️ grounded skeleton | see [docs/PROTOCOL_ANALYSIS.md](docs/PROTOCOL_ANALYSIS.md) — server-initiated channel encrypt + protobuf logon flow implemented from binary evidence; exact wire details still need a capture |
 | Auth impersonation | ⚠️ structural only | the gateway owns the modern login; legacy session emulation is partial |
 
 **Why the translator can't be finished blind:** the 2013 logon flow involved RSA-encrypted
@@ -79,6 +79,14 @@ Then **install the CA on the Lion Mac** (the old client must trust the gateway's
 3. Run `scripts/install_hosts.sh <GATEWAY_IP>` with sudo (backs up `/etc/hosts`).
 
 Start Steam on the Lion Mac. It should now talk only to the gateway.
+
+## Protocol analysis
+
+[`docs/PROTOCOL_ANALYSIS.md`](docs/PROTOCOL_ANALYSIS.md) is the deep dive into
+what the Lion-era client actually does — grounded in the real binary
+(`scripts/analyze_client.sh` reproduces the analysis): the server-initiated
+channel-encrypt handshake, the protobuf logon flow, the post-logon messages it
+requires, and the full gap list. Read it before touching the translator.
 
 ## Getting the client (the old Steam binary)
 
