@@ -60,12 +60,17 @@ async def _run_services(cfg: dict, *, run_cm: bool, run_content: bool,
         asyncio.create_task(bridge.warm_preload())
         log.info("content origin on 127.0.0.1:%s", cfg["content"]["listen_port"])
 
-    # Modern session first: the CM translator needs it.
+    # Modern back-end. Two paths:
+    #   1. account.* in config/env -> a pre-started session (legacy behavior)
+    #   2. no account configured -> a ModernFactory that logs in lazily with
+    #      the credentials the Lion client types into its own login screen
+    #      (decrypted via the swapped CM key). No .yaml credentials needed.
     from gateway.auth.bridge import credentials_from_config
-    from gateway.cm.modern import ModernSession
+    from gateway.cm.modern import ModernFactory, ModernSession
 
     creds = credentials_from_config(cfg)
     modern = None
+    factory = None
     if creds is not None:
         modern = ModernSession(creds, cfg["cm"].get("modern_cm_host", ""))
         try:
@@ -73,17 +78,22 @@ async def _run_services(cfg: dict, *, run_cm: bool, run_content: bool,
         except Exception as exc:
             log.error("modern session failed to start: %s", exc)
             modern = None
+        factory = ModernFactory(cfg, cfg["cm"].get("modern_cm_host", ""),
+                                preset=modern)
     else:
-        log.warning("No account configured — CM translator will refuse logons. "
-                    "Set account.* in config/gateway.local.yaml")
+        log.warning("No account in config — the bridge will use the credentials "
+                    "the client types into its login screen. Run `gen-cm-key` and "
+                    "swap the key into the client so the logon can be decrypted.")
+        factory = ModernFactory(cfg, cfg["cm"].get("modern_cm_host", ""))
 
     if run_tls:
         servers.extend(await run_tls_proxy(cfg, stop))
     if run_cm:
         if modern is None:
-            log.warning("No modern session (no account configured) — CM listener "
-                        "starts anyway, but legacy logons will be refused.")
-        servers.extend(await run_cm_server(cfg, modern, stop))
+            log.warning("Modern session starts on first legacy logon "
+                        "(credentials come from the client's login screen).")
+        servers.extend(await run_cm_server(cfg, modern, stop,
+                                           modern_factory=factory))
 
     log.info("gateway ready. Point the Lion machine's hosts file at %s",
              cfg.get("gateway_ip", "?"))
@@ -145,6 +155,10 @@ def main(argv: list[str] | None = None) -> int:
                        help="only the CM listener (no root needed; for the client simulator)")
 
     sub.add_parser("gen-certs")
+    sub.add_parser("gen-cm-key",
+                   help="generate the CM RSA keypair whose public key gets "
+                        "swapped into the client (enables reading the "
+                        "client's login password)")
 
     p_hosts = sub.add_parser("hosts", help="render/install the /etc/hosts block")
     p_hosts.add_argument("--ip", help="gateway IP to route to")
@@ -171,6 +185,23 @@ def main(argv: list[str] | None = None) -> int:
         leaf, _ = ensure_bundle_cert(cert_dir)
         print(f"CA cert:    {ca_cert}   <- install & trust this on the Lion machine")
         print(f"Leaf cert:  {leaf}")
+        return 0
+
+    if cmd == "gen-cm-key":
+        from gateway.cm.crypto import load_or_create_cm_key, spki_hex
+
+        key_path = Path(cfg["cm"].get("rsa_key", "certs/cm-rsa.key"))
+        if not key_path.is_absolute():
+            key_path = Path(confmod.PROJECT_ROOT) / key_path
+        key = load_or_create_cm_key(key_path)
+        print(f"CM RSA private key: {key_path}   (keep this on the bridge only)")
+        print(f"SPKI hex: {spki_hex(key)}")
+        print()
+        print("Next, on the machine with the Steam client, swap the client's")
+        print("embedded CM public key for this one so the bridge can read the")
+        print("username/password the client sends at logon:")
+        print(f"  ./scripts/patch_client.py --swap-key --key-pem {key_path}")
+        print(f"  ./scripts/patch_client.py --verify-key --key-pem {key_path}")
         return 0
 
     if cmd == "hosts":

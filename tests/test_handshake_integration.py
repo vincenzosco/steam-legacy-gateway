@@ -84,3 +84,79 @@ def test_capture_render_contains_frames():
     assert "ChannelEncryptRequest" in text
     assert "ChannelEncryptResult" in text
     assert "00000000" in text  # hexdump rows present
+
+
+def test_encrypted_handshake_end_to_end(tmp_path):
+    """Full encrypted exchange against the real server path.
+
+    The simulator behaves like the real client after the key-swap: session
+    key RSA-encrypted to the gateway's public key, channel AES-encrypted,
+    password RSA-encrypted. The gateway decrypts everything and completes
+    the MachineAuth flow over the encrypted channel.
+    """
+    from gateway.cm import crypto as cmcrypto
+
+    key_path = tmp_path / "cm-rsa.key"
+    cmcrypto.load_or_create_cm_key(key_path)
+
+    def scenario():
+        async def _run():
+            cfg = {"cm": {"listen_ports": [0], "capture_dir": "",
+                           "sentry_store": "", "rsa_key": str(key_path)},
+                   "account": {}, "gateway_ip": "127.0.0.1"}
+            servers = await run_cm_server(cfg, _FakeModern(), None)
+            server = servers[0]
+            port = server.sockets[0].getsockname()[1]
+            try:
+                return await run_handshake(
+                    "127.0.0.1", port, account="simuser",
+                    encrypted=True, key_pem=str(key_path),
+                    password_text="bridge-secret")
+            finally:
+                server.close()
+                await server.wait_closed()
+
+        return asyncio.run(_run())
+
+    res = scenario()
+    assert res.channel_result == 1
+    assert res.logon_eresult == 1
+    assert res.session_token is not None
+    assert res.sentry_sha != b""
+    assert res.login_key_unique_id is not None
+    names = [f.name for f in res.frames]
+    assert "ClientLogOnResponse" in names
+    assert "ClientUpdateMachineAuth" in names
+    assert "ClientNewLoginKey" in names
+
+
+def test_encrypted_logon_without_rsa_key_drops_connection(tmp_path):
+    """A client that encrypts against a gateway without the RSA key cannot be
+    read: the encrypted logon parses as garbage and the connection drops. The
+    fix is `python -m gateway gen-cm-key` + `patch_client.py --swap-key`."""
+    import pytest
+
+    from gateway.cm import crypto as cmcrypto
+
+    key_path = tmp_path / "cm-rsa.key"
+    cmcrypto.load_or_create_cm_key(key_path)
+
+    async def _run():
+        # NOTE: rsa_key deliberately NOT in cfg — gateway can't decrypt
+        cfg = {"cm": {"listen_ports": [0], "capture_dir": "",
+                       "sentry_store": ""},
+               "account": {}, "gateway_ip": "127.0.0.1"}
+        servers = await run_cm_server(cfg, _FakeModern(), None)
+        server = servers[0]
+        port = server.sockets[0].getsockname()[1]
+        try:
+            return await run_handshake(
+                "127.0.0.1", port, account="simuser",
+                encrypted=True, key_pem=str(key_path),
+                password_text="bridge-secret")
+        finally:
+            server.close()
+            await server.wait_closed()
+
+    with pytest.raises(ConnectionError):
+        asyncio.run(_run())

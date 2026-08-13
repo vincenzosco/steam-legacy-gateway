@@ -8,7 +8,6 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import struct
 import time
 from pathlib import Path
 from typing import Any
@@ -58,19 +57,24 @@ def _open_capture(capture_dir: str, peer) -> object | None:
 
 
 async def _handle_conn(reader: asyncio.StreamReader, writer: asyncio.StreamWriter,
-                       cfg: dict, modern: ModernSession | None) -> None:
+                       cfg: dict, modern: ModernSession | None,
+                       modern_factory=None) -> None:
     peer = writer.get_extra_info("peername")
     capture_fh = _open_capture(cfg["cm"].get("capture_dir", "") or "", peer)
     if capture_fh is not None:
         writer = _CaptureWriter(writer, capture_fh)
-    session = TranslatorSession(writer, cfg, modern)
+    session = TranslatorSession(writer, cfg, modern, modern_factory=modern_factory,
+                                rsa_key=cfg.get("cm", {}).get("rsa_key") or None)
     log.info("legacy CM connection from %s", peer)
     try:
         # Server-initiated channel encryption: send ChannelEncryptRequest(130).
         await session.start_handshake()
         while True:
             try:
-                frame = await asyncio.wait_for(read_frame(reader), timeout=180)
+                frame = await asyncio.wait_for(
+                    read_frame(reader, decrypt=session.decrypt_payload,
+                               on_raw=_capture_inbound(capture_fh)),
+                    timeout=180)
             except FramingError as exc:
                 log.warning("framing error from %s: %s", peer, exc)
                 break
@@ -81,10 +85,6 @@ async def _handle_conn(reader: asyncio.StreamReader, writer: asyncio.StreamWrite
                 break
             if frame is None:
                 break
-            if capture_fh is not None:
-                # Rebuild the exact wire bytes: 4-byte length prefix + payload.
-                capture_fh.write(b"<" + struct.pack("<I", len(frame.raw)) + frame.raw)
-                capture_fh.flush()
             await session.handle(frame)
     except (ConnectionResetError, BrokenPipeError):
         pass
@@ -100,14 +100,25 @@ async def _handle_conn(reader: asyncio.StreamReader, writer: asyncio.StreamWrite
 
 
 async def run_cm_server(cfg: dict, modern: ModernSession,
-                        stop_event: asyncio.Event) -> list[asyncio.Server]:
+                        stop_event: asyncio.Event,
+                        modern_factory=None) -> list[asyncio.Server]:
     servers: list[asyncio.Server] = []
     for port in cfg["cm"]["listen_ports"]:
         server = await asyncio.start_server(
-            lambda r, w: _handle_conn(r, w, cfg, modern),
+            lambda r, w: _handle_conn(r, w, cfg, modern,
+                                      modern_factory=modern_factory),
             "0.0.0.0",
             port,
         )
         servers.append(server)
         log.info("legacy CM listener on :%s", port)
     return servers
+
+
+def _capture_inbound(capture_fh):
+    """Return an on_raw callback that tees the exact wire bytes to the capture."""
+    def cb(wire: bytes) -> None:
+        if capture_fh is not None:
+            capture_fh.write(b"<" + wire)
+            capture_fh.flush()
+    return cb

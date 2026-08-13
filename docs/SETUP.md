@@ -39,27 +39,36 @@ pip install -r requirements.txt
 (ValvePython — the modern CM back-end the translator drives). If you skip
 `steam`, the TLS/content layers still run but the CM translator can't log you in.
 
-### 3. Configure your account
+### 3. Configure the gateway IP (and optionally credentials)
 
 ```bash
 cp config/gateway.yaml config/gateway.local.yaml
 ```
 
-Edit `config/gateway.local.yaml`:
+Edit `config/gateway.local.yaml` — at minimum the IP:
 
 ```yaml
 gateway_ip: 192.168.1.50      # the IP from `ipconfig getifaddr en0`
-account:
-  username: "your-steam-login"
-  password: "your-password"
-  steam_guard: ""             # leave empty to be prompted at login
 content:
   depot_downloader_path: ""   # optional: absolute path to DepotDownloader if installed
 ```
 
-`config/gateway.local.yaml` is gitignored — credentials never get committed.
-You can also use `STEAM_USERNAME` / `STEAM_PASSWORD` / `STEAM_GUARD_CODE` env
-vars instead.
+**Credentials: leave `account.*` empty.** The bridge reads the username and
+password the client types into its *own* login screen on the Lion Mac and
+forwards them to Valve's modern servers — nothing to store in the config. To
+make that possible, generate the bridge's CM RSA key and swap it into the
+client (one-time):
+
+```bash
+python -m gateway gen-cm-key                     # bridge keypair (once)
+./scripts/patch_client.py --swap-key --key-pem certs/cm-rsa.key
+./scripts/patch_client.py --verify-key --key-pem certs/cm-rsa.key
+```
+
+If you *do* set `account.username` / `account.password` (or the
+`STEAM_USERNAME` / `STEAM_PASSWORD` env vars), the bridge uses those instead
+— the client-supplied credentials are ignored. `config/gateway.local.yaml` is
+gitignored either way.
 
 ### 4. Generate certificates
 
@@ -207,18 +216,23 @@ What works **today** (verified):
 - Content-origin routing (legacy content hosts → local depot bridge)
 - Hosts/certs tooling, client fetch + freeze, the analysis tooling
 
-What is **implemented but unverified** (needs a real client + capture):
+What is **implemented and integration-tested** (simulator, incl. CI):
 
-- The CM handshake (server-initiated channel encryption, protobuf logon flow) —
-  the wire details carry `VERIFY-BY-CAPTURE` notes in the code
+- The CM handshake + channel crypto — the bridge RSA-decrypts the client's
+  session key (after the key-swap) and AES-256 encrypts/decrypts the
+  post-handshake payloads; the logon password is decrypted and forwarded to
+  the modern session. The whole flow runs end-to-end in fully encrypted mode
+  (`tests/test_handshake_integration.py`, `--encrypted` sim mode).
+- Steam Guard MachineAuth (sentry push/read/request + NewLoginKey pair).
+
+Still needs a **real client capture** to confirm: the exact RSA padding on the
+session-key/password blobs (PKCS#1 assumed, OAEP fallback built in) and the
+AES frame layout — plus the items below. Expect the encrypted handshake to
+work on the wire.
 
 What is **missing** (see PROTOCOL_ANALYSIS.md §3): app-info/license data (the
 library stays empty), friends/chat, game-launch session tickets, and the
 modern store/community pages (old WebKit can't render them — a dead end).
-
-So: expect the handshake to *start* on the wire, but a full
-logon + playable library is not there yet. The gateway's value today is the
-verified plumbing plus the analysis that tells you exactly what's left.
 
 ## Troubleshooting quick reference
 
@@ -229,4 +243,5 @@ verified plumbing plus the analysis that tells you exactly what's left.
 | Client hangs with no CM connection in logs | patch the binary: `./scripts/patch_client.py --ip <gateway-ip>` (Part B §3); PF redirect only as fallback |
 | TLS errors in the client | CA not trusted on Lion (Part B §2) |
 | Client auto-updated itself | re-extract and re-freeze (`Steam.cfg`) |
-| Warnings about `--no-modern` / no account | configure `account.*` (Part A §3) |
+| Logon refused with "could not decrypt logon password" | the client still encrypts to Valve's key — run `python -m gateway gen-cm-key` + `./scripts/patch_client.py --swap-key` (Part A §3) |
+| Warnings about no account configured | that is expected now — the bridge takes credentials from the client's login screen (Part A §3) |

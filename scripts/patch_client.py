@@ -28,6 +28,13 @@ Usage:
   ./scripts/patch_client.py --dry-run --ip 203.0.113.7
   ./scripts/patch_client.py --restore
   ./scripts/patch_client.py --verify --expect 203.0.113.7
+
+  # swap the embedded CM RSA key for the bridge's (so the client's logon
+  # username/password can be read by the bridge):
+  #   python -m gateway gen-cm-key            (on the bridge, once)
+  ./scripts/patch_client.py --swap-key --key-pem certs/cm-rsa.key
+  ./scripts/patch_client.py --verify-key --key-pem certs/cm-rsa.key
+  ./scripts/patch_client.py --swap-key --key-pem certs/cm-rsa.key --all-binaries
 """
 from __future__ import annotations
 
@@ -178,6 +185,184 @@ def read_endpoint_file(path: Path) -> str:
     return line
 
 
+# -- embedded CM RSA public key swap --------------------------------------------
+#
+# The client embeds its CM public keys as NUL-terminated 320-char lowercase
+# hex-ASCII DER strings (two tables in steamclient.dylib, see
+# docs/PROTOCOL_ANALYSIS.md §2.3). The client encrypts its channel session key
+# and logon password to the Public universe key. Swapping that string for the
+# bridge's own public key (same 320-char length, in place) lets the bridge
+# decrypt both — that is what makes the credentials-from-the-client flow work.
+
+_KEY_SLOT_RE = re.compile(rb"[0-9a-f]{320}\x00")
+# The Public universe modulus this client ships (dfec1ad6...) — slots whose
+# decoded DER carries this modulus are the ones the CM handshake uses.
+PUB_MODULUS_PREFIX = "dfec1ad62c10662c"
+
+# Other binaries in the bundle that embed the same key table. Only
+# steamclient.dylib matters for the CM logon; the rest are patched with
+# --all-binaries for full coverage.
+BUNDLE_KEY_BINARIES = [
+    "**/steamclient.dylib",
+    "**/friendsui.dylib",
+    "**/libsteam.dylib",
+    "**/osx32/steam",
+    "**/steam_osx",
+    "**/steamservice.dylib",
+]
+
+
+def _parse_spki(hex_str: str):
+    """Parse a 320-char hex slot as a DER RSA SPKI, or None."""
+    try:
+        from cryptography.hazmat.primitives import serialization
+
+        der = bytes.fromhex(hex_str)
+        if len(der) != 160:
+            return None
+        return serialization.load_der_public_key(der)
+    except Exception:
+        return None
+
+
+def _slot_modulus_prefix(hex_str: str) -> str:
+    pub = _parse_spki(hex_str)
+    if pub is None:
+        return ""
+    return hex(pub.public_numbers().n)[2:][:16]
+
+
+def _is_valve_public(hex_str: str) -> bool:
+    """True if the slot still holds the Valve Public universe key."""
+    return _slot_modulus_prefix(hex_str) == PUB_MODULUS_PREFIX
+
+
+def _find_key_slots(data: bytes) -> list[int]:
+    """Offsets of every embedded RSA-SPKI key slot in `data`.
+
+    Structural detection (any parseable 160-byte RSA SPKI), so it works
+    whether the slots hold Valve's keys or the bridge's.
+    """
+    return [m.start() for m in _KEY_SLOT_RE.finditer(data)
+            if _parse_spki(m.group(0)[:-1].decode()) is not None]
+
+
+def _read_spki_hex(key_pem: Path | None, spki_hex: str | None) -> str:
+    if spki_hex:
+        hx = spki_hex.lower().strip()
+    elif key_pem is not None:
+        if not key_pem.is_file():
+            print(f"error: key file {key_pem} not found "
+                  f"(run `python -m gateway gen-cm-key` first)", file=sys.stderr)
+            raise SystemExit(2)
+        from cryptography.hazmat.primitives import serialization
+
+        key = serialization.load_pem_private_key(key_pem.read_bytes(),
+                                                 password=None)
+        hx = key.public_key().public_bytes(
+            serialization.Encoding.DER,
+            serialization.PublicFormat.SubjectPublicKeyInfo).hex()
+    else:
+        print("error: --swap-key/--verify-key need --key-pem or --spki-hex",
+              file=sys.stderr)
+        raise SystemExit(2)
+    if len(hx) != 320:
+        print(f"error: SPKI hex is {len(hx)} chars, expected 320 — generate "
+              f"the key with `python -m gateway gen-cm-key`", file=sys.stderr)
+        raise SystemExit(2)
+    return hx
+
+
+def swap_key(dylib: Path, target_hex: str, *, dry_run: bool = False) -> int:
+    """Replace the embedded Valve Public key slot(s) with the bridge's key.
+
+    Only the Public-universe slot (the one the CM handshake uses) is swapped;
+    the Beta/Internal/Dev/5th slots are left as Valve's. Re-running is
+    idempotent (already-swapped slots are skipped).
+    """
+    if not dylib.is_file():
+        print(f"error: {dylib} not found (run scripts/fetch_steam_client.sh first)",
+              file=sys.stderr)
+        return 2
+    data = dylib.read_bytes()
+    offsets = _find_key_slots(data)
+    if not offsets:
+        print(f"no embedded RSA key slots found in {dylib} — wrong file?")
+        return 1
+    if len(target_hex) != 320:
+        print(f"error: target hex is {len(target_hex)} chars, expected 320",
+              file=sys.stderr)
+        return 2
+
+    new_bytes = bytearray(data)
+    applied = 0
+    for off in offsets:
+        old = data[off:off + 320].decode()
+        if old == target_hex:
+            print(f"  ok    @0x{off:x} already the bridge key")
+            continue
+        if not _is_valve_public(old):
+            continue  # other universe keys stay untouched
+        new_bytes[off:off + 320] = target_hex.encode()
+        applied += 1
+        print(f"  patch @0x{off:x} Public RSA key -> bridge key")
+
+    print(f"\n{applied} Public key slot(s) patched.")
+    if dry_run:
+        print("(dry-run — file not modified)")
+        return 0
+    if applied == 0:
+        return 0
+    orig = dylib.with_name(dylib.name + BACKUP_SUFFIX)
+    if not orig.exists():
+        shutil.copy2(dylib, orig)
+        print(f"backup saved: {orig}")
+    dylib.write_bytes(bytes(new_bytes))
+    print(f"patched {dylib} — the client now encrypts to the bridge's key")
+    return 0
+
+
+def verify_key(dylib: Path, target_hex: str) -> int:
+    """Exit 0 only when the Public slot holds the bridge key.
+
+    Checks: at least one embedded slot holds the bridge key AND no slot still
+    holds the Valve Public key (i.e. the handshake key was actually swapped).
+    """
+    if not dylib.is_file():
+        print(f"{dylib} not found", file=sys.stderr)
+        return 1
+    data = dylib.read_bytes()
+    slots = [data[off:off + 320].decode() for off in _find_key_slots(data)]
+    if not slots:
+        print(f"FAIL: no embedded RSA key slots found in {dylib}")
+        return 1
+    bridge_count = sum(1 for s in slots if s == target_hex)
+    valve_left = sum(1 for s in slots if _is_valve_public(s))
+    if bridge_count > 0 and valve_left == 0:
+        print(f"OK — {bridge_count} slot(s) hold the bridge key, "
+              f"no Valve Public key remains")
+        return 0
+    print(f"FAIL — {bridge_count} slot(s) hold the bridge key, "
+          f"{valve_left} still hold Valve's Public key (run --swap-key)")
+    return 1
+
+
+def _swap_all_binaries(target_hex: str, *, dry_run: bool) -> int:
+    """Apply the key swap to every bundle binary that embeds the key table."""
+    from pathlib import Path as _P
+
+    root = _P("client")
+    if not root.is_dir():
+        print(f"no client/ directory — run scripts/fetch_steam_client.sh first")
+        return 1
+    rc = 0
+    for pattern in BUNDLE_KEY_BINARIES:
+        for path in sorted(root.glob(pattern)):
+            print(f"=== {path} ===")
+            rc |= swap_key(path, target_hex, dry_run=dry_run)
+    return rc
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--dylib", type=Path, default=DEFAULT_DYLIB)
@@ -189,12 +374,33 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--verify", action="store_true", help="check current state")
     parser.add_argument("--expect", help="with --verify: require every slot to "
                         "point at this IP (exit 0 only if fully patched)")
+    parser.add_argument("--swap-key", action="store_true",
+                        help="embed the bridge's CM public key into the client "
+                        "(so it encrypts its logon to the bridge)")
+    parser.add_argument("--verify-key", action="store_true",
+                        help="exit 0 only if the embedded key is the bridge's")
+    parser.add_argument("--key-pem", type=Path, help="bridge CM private key PEM "
+                        "(from `python -m gateway gen-cm-key`)")
+    parser.add_argument("--spki-hex", help="bridge SPKI hex directly (320 chars)")
+    parser.add_argument("--all-binaries", action="store_true",
+                        help="with --swap-key: also patch the other bundle "
+                        "binaries that embed the key table")
     args = parser.parse_args(argv)
 
     if args.restore:
         return restore(args.dylib)
     if args.verify:
         return verify(args.dylib, expect=args.expect)
+    if args.swap_key or args.verify_key:
+        try:
+            target_hex = _read_spki_hex(args.key_pem, args.spki_hex)
+        except SystemExit as exc:
+            return int(exc.code or 2)
+        if args.all_binaries:
+            return _swap_all_binaries(target_hex, dry_run=args.dry_run)
+        if args.swap_key:
+            return swap_key(args.dylib, target_hex, dry_run=args.dry_run)
+        return verify_key(args.dylib, target_hex)
 
     ip = args.ip
     if not ip:

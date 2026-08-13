@@ -55,20 +55,16 @@ cd steam-legacy-gateway
 python3 -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
-cp config/gateway.yaml config/gateway.local.yaml   # edit: gateway_ip + account
+cp config/gateway.yaml config/gateway.local.yaml   # edit: gateway_ip
 python -m gateway gen-certs                        # local CA + per-host certs
+python -m gateway gen-cm-key                       # CM RSA keypair (once)
 ```
 
-Edit `config/gateway.local.yaml` (gitignored — credentials never get
-committed):
-
-```yaml
-gateway_ip: 192.168.1.50       # the bridge's LAN IP from step 0
-account:
-  username: "your-steam-login"
-  password: "your-password"
-  steam_guard: ""              # leave empty to be prompted at first login
-```
+Edit `config/gateway.local.yaml` (gitignored): set `gateway_ip` to the
+bridge's LAN IP from step 0. **Leave `account.*` empty** — the credentials
+come from the client's own login screen (the bridge decrypts them with the CM
+key from `gen-cm-key`, see step 3). Optionally set `STEAM_USERNAME` /
+`STEAM_PASSWORD` env vars in the unit file to override.
 
 Sanity check before making it a service:
 
@@ -167,7 +163,19 @@ This rewrites all 74 hardcoded CM address slots in `steamclient.dylib` in
 place (same-length-or-shorter only, NUL-padded, one-time backup at
 `steamclient.dylib.orig`). Preview with `--dry-run`, revert with `--restore`.
 
-- The CM layer now needs **no** `/etc/hosts` entries and no PF redirect.
+**Also swap the CM key** so the bridge can read the credentials the client
+sends (one-time):
+
+```bash
+./scripts/patch_client.py --swap-key --key-pem certs/cm-rsa.key
+./scripts/patch_client.py --verify-key --key-pem certs/cm-rsa.key
+```
+
+Now type your username/password in the Steam client's normal login screen on
+the Lion Mac — the bridge decrypts them and forwards to the modern servers.
+If a Steam Guard code is required, the bridge prompts on its console.
+
+- The CM layer needs **no** `/etc/hosts` entries and no PF redirect.
 - The hosts file is still used for the **TLS hosts** (store, api, community) —
   install it with `sudo ./scripts/install_hosts.sh 192.168.1.50` (Part B of
   `docs/SETUP.md`).

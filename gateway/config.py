@@ -20,6 +20,7 @@ DEFAULTS: dict[str, Any] = {
         "modern_cm_host": "",
         "capture_dir": "",  # set to e.g. captures/ to log every connection's raw bytes
         "sentry_store": "config/sentries.json",  # Steam Guard sentry persistence
+        "rsa_key": "certs/cm-rsa.key",  # bridge CM RSA key (see `gen-cm-key`)
     },
     "account": {"username": "", "password": "", "steam_guard": ""},
     "content": {
@@ -61,6 +62,7 @@ def load_config(path: str | Path | None = None) -> dict[str, Any]:
     _resolve("cert_dir")
     _resolve("cache_dir")
     _resolve("sentry_store")
+    _resolve("rsa_key")
     return cfg
 
 

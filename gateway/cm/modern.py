@@ -75,6 +75,17 @@ class ModernSession:
         except (TypeError, ValueError):
             return 0
 
+    async def wait_ready(self, timeout: float = 90.0) -> bool:
+        """Wait for the modern login to complete (success or failure)."""
+        fut = self._ready
+        if fut is None:
+            return False
+        try:
+            await asyncio.wait_for(asyncio.shield(fut), timeout=timeout)
+            return True
+        except (asyncio.TimeoutError, RuntimeError):
+            return False
+
     # -- gevent-thread internals -----------------------------------------------
 
     def _emit(self, event: dict[str, Any]) -> None:
@@ -133,9 +144,46 @@ class ModernSession:
             pass
 
     def _on_logged_on(self) -> None:
-        log.info("modern logged_on")
+        log.info("modern logged_on (%s)", self.credentials.username)
         self._emit({"type": "logged_on"})
         self._resolve_ready()
+
+
+class ModernFactory:
+    """Builds the shared modern session lazily, from legacy client credentials.
+
+    This is the 'credentials from the client's login screen' path: the first
+    legacy ClientLogon that reaches the bridge supplies the username/password
+    (decrypted via the swapped CM key) and the modern session logs in with
+    exactly those — no credentials in config/gateway.local.yaml.
+
+    If the operator configured account.* (or env vars) at boot, `preset` is
+    that pre-started session and client credentials are ignored.
+    """
+
+    def __init__(self, cfg: dict, modern_cm_host: str = "",
+                 preset: ModernSession | None = None):
+        self.cfg = cfg
+        self.modern_cm_host = modern_cm_host
+        self.preset = preset
+        self._session: ModernSession | None = None
+        self._lock = asyncio.Lock()
+
+    async def get(self, credentials: Credentials) -> ModernSession | None:
+        """Return the shared modern session, creating + logging in on first use."""
+        if self.preset is not None:
+            return self.preset
+        async with self._lock:
+            if self._session is None:
+                session = ModernSession(credentials, self.modern_cm_host)
+                try:
+                    await session.start()
+                except Exception as exc:
+                    log.error("modern login failed for %r: %s",
+                              credentials.username, exc)
+                    return None
+                self._session = session
+            return self._session
 
     def _on_error(self, error: Exception) -> None:
         self._emit({"type": "error", "error": str(error)})

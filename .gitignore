@@ -12,3 +12,7 @@ client/
 __pycache__/
 *.pyc
 .venv/
+
+# macOS junk / debug captures
+.DS_Store
+captures/

@@ -137,3 +137,122 @@ def test_read_endpoint_file(tmp_path):
     f = tmp_path / "endpoint.txt"
     f.write_text("203.0.113.7\n")
     assert patch_client.read_endpoint_file(f) == "203.0.113.7"
+
+
+# -- key swap ------------------------------------------------------------------
+
+def _keypair_and_hex():
+    from cryptography.hazmat.primitives import serialization as _ser
+
+    from gateway.cm import crypto as cmcrypto
+
+    key = cmcrypto.generate_cm_key()
+    hx = cmcrypto.spki_hex(key)
+    pem = key.private_bytes(
+        _ser.Encoding.PEM, _ser.PrivateFormat.TraditionalOpenSSL,
+        _ser.NoEncryption())
+    mod_prefix = hex(key.public_key().public_numbers().n)[2:][:16]
+    return key, hx, pem, mod_prefix
+
+
+def _fake_key_dylib(tmp_path: Path, slots: list[str]) -> Path:
+    """Binary holding `slots` 320-char hex strings + NUL each."""
+    d = tmp_path / "steamclient.dylib"
+    d.write_bytes(b"".join(s.encode() + b"\x00" for s in slots))
+    return d
+
+
+def test_find_key_slots_detects_spki_slots(tmp_path):
+    # Structural detection: any parseable 160-byte RSA SPKI, whatever key.
+    _, hx, _, _ = _keypair_and_hex()
+    dylib = _fake_key_dylib(tmp_path, [hx, "a" * 320])  # 2nd is not a DER
+    offsets = patch_client._find_key_slots(dylib.read_bytes())
+    assert offsets == [0]
+
+
+def test_is_valve_public_matches_prefix():
+    _, hx, _, mod = _keypair_and_hex()
+    _, hx2, _, _ = _keypair_and_hex()
+    old = patch_client.PUB_MODULUS_PREFIX
+    patch_client.PUB_MODULUS_PREFIX = mod
+    try:
+        assert patch_client._is_valve_public(hx) is True
+        assert patch_client._is_valve_public(hx2) is False
+    finally:
+        patch_client.PUB_MODULUS_PREFIX = old
+
+
+def test_swap_key_replaces_slots(tmp_path):
+    _, hx_a, _, mod = _keypair_and_hex()
+    _, hx_b, _, _ = _keypair_and_hex()
+    assert hx_a != hx_b
+    dylib = _fake_key_dylib(tmp_path, [hx_a, hx_a])
+    old = patch_client.PUB_MODULUS_PREFIX
+    patch_client.PUB_MODULUS_PREFIX = mod
+    try:
+        rc = patch_client.swap_key(dylib, hx_b)
+    finally:
+        patch_client.PUB_MODULUS_PREFIX = old
+    assert rc == 0
+    data = dylib.read_bytes()
+    assert data[:320] == hx_b.encode()
+    assert data[321:321 + 320] == hx_b.encode()
+
+
+def test_swap_key_dry_run_does_not_modify(tmp_path):
+    _, hx_a, _, mod = _keypair_and_hex()
+    _, hx_b, _, _ = _keypair_and_hex()
+    dylib = _fake_key_dylib(tmp_path, [hx_a])
+    old = patch_client.PUB_MODULUS_PREFIX
+    patch_client.PUB_MODULUS_PREFIX = mod
+    try:
+        rc = patch_client.swap_key(dylib, hx_b, dry_run=True)
+    finally:
+        patch_client.PUB_MODULUS_PREFIX = old
+    assert rc == 0
+    assert dylib.read_bytes()[:320] == hx_a.encode()
+
+
+def test_verify_key_ok_and_fail(tmp_path):
+    _, hx_a, _, mod = _keypair_and_hex()
+    _, hx_b, _, _ = _keypair_and_hex()
+    old = patch_client.PUB_MODULUS_PREFIX
+    patch_client.PUB_MODULUS_PREFIX = mod
+    try:
+        # pristine: Valve Public still present -> not swapped -> FAIL
+        dylib = _fake_key_dylib(tmp_path, [hx_a])
+        assert patch_client.verify_key(dylib, hx_b) == 1
+        # swapped: bridge key in place, no Valve Public left -> OK
+        patch_client.swap_key(dylib, hx_b)
+        assert patch_client.verify_key(dylib, hx_b) == 0
+        # wrong file: no slots
+        empty = tmp_path / "other.bin"
+        empty.write_bytes(b"nope")
+        assert patch_client.verify_key(empty, hx_b) == 1
+    finally:
+        patch_client.PUB_MODULUS_PREFIX = old
+
+
+def test_swap_key_via_cli_key_pem(tmp_path, capsys):
+    _, hx_a, _, mod = _keypair_and_hex()
+    _, hx_b, pem_b, _ = _keypair_and_hex()
+    pem_b_path = tmp_path / "key-b.pem"
+    pem_b_path.write_bytes(pem_b)
+    dylib = _fake_key_dylib(tmp_path, [hx_a])
+    old = patch_client.PUB_MODULUS_PREFIX
+    patch_client.PUB_MODULUS_PREFIX = mod
+    try:
+        rc = patch_client.main(["--dylib", str(dylib),
+                                "--swap-key", "--key-pem", str(pem_b_path)])
+    finally:
+        patch_client.PUB_MODULUS_PREFIX = old
+    assert rc == 0
+    assert dylib.read_bytes()[:320] == hx_b.encode()
+
+
+def test_spki_hex_wrong_length_rejected(tmp_path, capsys):
+    dylib = _fake_key_dylib(tmp_path, ["a" * 320])
+    rc = patch_client.main(["--dylib", str(dylib),
+                            "--swap-key", "--spki-hex", "abc"])
+    assert rc == 2
+    assert "expected 320" in capsys.readouterr().err

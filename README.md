@@ -40,8 +40,9 @@ against packet captures from a real 2013 client:
 | Content bridge (legacy URLs → depot cache) | complete | minimal HTTP origin + cache + fetcher |
 | Legacy CM framing + EMsg layer | complete | renumbered EMsg set (from the binary's own table), VT01 + proto-flag framing, unit-tested |
 | Steam Guard MachineAuth flow | complete | all 6 MachineAuth messages + NewLoginKey pair, job-id targeting, persistent sentry store, integration-tested end-to-end |
-| Modern back-end (ValvePython/steam) | complete; needs your account | install `steam`, set credentials in config |
-| CM translator / message mapping | grounded | see [docs/PROTOCOL_ANALYSIS.md](docs/PROTOCOL_ANALYSIS.md) — channel encrypt + protobuf logon + post-logon set implemented from the binary + 2015-era SteamKit; the session-key story is resolved (keys embedded as hex-ASCII DER, key-swap patch defined — §2.3) |
+| Modern back-end (ValvePython/steam) | complete; credentials from the client | the gateway logs in with the username/password the client types into its own login screen (decrypted via the swapped CM key) — nothing in config needed; Steam Guard is prompted on the bridge console |
+| Channel crypto (session key + AES) | implemented | `gateway/cm/crypto.py` — RSA-decrypts the client's session key (key-swap, §2.3), AES-256-encrypts/decrypts post-handshake payloads per SteamKit CryptoHelper; integration-tested in plaintext AND fully encrypted mode (CI) |
+| CM translator / message mapping | grounded | see [docs/PROTOCOL_ANALYSIS.md](docs/PROTOCOL_ANALYSIS.md) — channel encrypt + protobuf logon + post-logon set implemented from the binary + 2015-era SteamKit; the session-key story is resolved (keys embedded as hex-ASCII DER, key-swap implemented — §2.3) |
 | Auth impersonation | structural only | the gateway owns the modern login; legacy session emulation is partial |
 
 **Why the translator can't be finished blind:** the 2013 logon flow involved RSA-encrypted
@@ -49,6 +50,33 @@ passwords against the CM public key and legacy key-value header fields that chan
 frequently. EMsg values and struct layouts here are taken from SteamKit's public sources
 and SteamDatabase's tracked protobufs; exact 2013 behavior must be confirmed with packet
 captures from a real client before a real logon will complete.
+
+## Credentials come from the client's login screen
+
+No more credentials in `config/gateway.local.yaml`. The client encrypts its
+logon to the CM server's RSA key — after a one-time key swap, that key is the
+bridge's, so the bridge can read the username/password the client types and
+forward them to Valve's modern servers:
+
+```bash
+# 1. on the bridge, generate the CM RSA keypair (once):
+python -m gateway gen-cm-key
+
+# 2. on the machine with the client, swap the embedded Public key for the
+#    bridge's (same-length, in-place; backup at steamclient.dylib.orig):
+./scripts/patch_client.py --swap-key --key-pem certs/cm-rsa.key
+./scripts/patch_client.py --verify-key --key-pem certs/cm-rsa.key
+
+# 3. run the bridge WITHOUT account.* in the config, then launch Steam on the
+#    Lion Mac and log in as usual — the bridge decrypts and forwards.
+```
+
+- The swapped key is 1024-bit with exponent 3 to fit the client's 320-char
+  embedded slot (Valve's own keys use e=17; see PROTOCOL_ANALYSIS §2.3). The
+  channel is home-LAN only and the modern login rides on TLS.
+- If the modern server asks for a Steam Guard code, the bridge prompts on its
+  console (run it in the foreground, or set `STEAM_GUARD_CODE`).
+- Revert with `./scripts/patch_client.py --restore`.
 
 ## Legal / account-risk disclaimer
 

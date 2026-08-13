@@ -29,8 +29,18 @@ The analysis in docs/PROTOCOL_ANALYSIS.md (grounded in the actual binary +
     pushes ClientAccountInfo (768) + ClientCMList (783) so the client's
     library/CM-rotation UI has data.
 
-VERIFY-BY-CAPTURE notes: exact AES scheme after the handshake and the session
-key's RSA story are the open questions (docs/PROTOCOL_ANALYSIS.md §2.2).
+  * the channel crypto is implemented (gateway/cm/crypto.py): the client's
+    session key is RSA-encrypted to the embedded CM public key — after the
+    key-swap (`gen-cm-key` + `patch_client.py --swap-key`) that is the
+    bridge's key, so the bridge decrypts it (PKCS#1 v1.5, OAEP fallback) and
+    AES-256 encrypts/decrypts the post-handshake payloads with it. The logon
+    password (CMsgClientLogon.password, also RSA-encrypted to the same key)
+    is decrypted and forwarded to the modern session — the credentials come
+    from the client's login screen, not from config.
+
+VERIFY-BY-CAPTURE: the exact RSA padding on the wire (PKCS#1 assumed, OAEP
+fallback built in) and the AES frame layout remain to be confirmed against a
+real client capture (docs/PROTOCOL_ANALYSIS.md §2.3).
 """
 from __future__ import annotations
 
@@ -40,11 +50,13 @@ import logging
 import os
 import struct
 from enum import Enum
+from pathlib import Path
 
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric import rsa
 
 from gateway.auth.bridge import Credentials, credentials_from_config
+from gateway.cm import crypto as cmcrypto
 from gateway.cm import emsg, machineauth, proto
 from gateway.cm.framing import Frame, decode_frame, encode_handshake, encode_legacy, encode_proto
 from gateway.cm.modern import ModernSession
@@ -120,15 +132,33 @@ class TranslatorSession:
     """One legacy CM connection, translated onto the shared modern session."""
 
     def __init__(self, writer: asyncio.StreamWriter, cfg: dict,
-                 modern: ModernSession | None, sentry_store=None):
+                 modern: ModernSession | None, sentry_store=None,
+                 modern_factory=None, rsa_key=None):
         self.writer = writer
         self.cfg = cfg
         self.modern = modern
+        self.modern_factory = modern_factory
         self.state = State.AWAIT_ENCRYPT
         self.steam_id = 0
         self.session_id = 1
         self.session_token = os.urandom(8).hex()
         self._client_session_key_encrypted = b""
+        self._session_key: bytes | None = None  # set after the handshake
+        # rsa_key may be a loaded key object or a path to the PEM.
+        self._rsa_key = None
+        key_path = rsa_key if isinstance(rsa_key, (str, Path)) else None
+        if isinstance(rsa_key, rsa.RSAPrivateKey):
+            self._rsa_key = rsa_key
+        else:
+            key_path = key_path or cfg.get("cm", {}).get("rsa_key", "") or ""
+            if key_path and Path(key_path).is_file():
+                try:
+                    from cryptography.hazmat.primitives import serialization as _ser
+
+                    self._rsa_key = _ser.load_pem_private_key(
+                        Path(key_path).read_bytes(), password=None)
+                except Exception as exc:
+                    log.warning("could not load CM RSA key %s: %s", key_path, exc)
         self._account = ""
         self._next_job_id = 1
         self.sentry_store = sentry_store or machineauth.SentinelStore(
@@ -184,11 +214,29 @@ class TranslatorSession:
             "client channel encrypt response: proto v%d, key_size %d, crc %08x, %d bytes",
             protocol_version, key_size, crc, len(body),
         )
-        # TODO-VERIFY: decrypt `key` with our private key once the key story is
-        # resolved (docs/PROTOCOL_ANALYSIS.md §2.2). The client encrypts it with
-        # *something* — embedded Steam key or a server-provided key — and that
-        # determines whether a pure MITM can read post-handshake traffic.
-        # We store it so a capture can be compared byte-for-byte.
+        # Decrypt the client's session key with the bridge's RSA key (the
+        # client encrypted it to the *embedded* CM public key — after the
+        # key-swap that is ours, see docs/PROTOCOL_ANALYSIS.md §2.3).
+        if self._rsa_key is not None and key:
+            plain = cmcrypto.rsa_decrypt(key, self._rsa_key)
+            if plain is not None and len(plain) == cmcrypto.SESSION_KEY_LEN:
+                self._session_key = plain
+                log.info("channel session key decrypted (%d bytes) — "
+                         "post-handshake frames will be encrypted", len(plain))
+            elif plain is not None:
+                log.warning("session key decrypted to %d bytes (expected %d) — "
+                            "keeping plaintext mode",
+                            len(plain), cmcrypto.SESSION_KEY_LEN)
+            else:
+                log.warning("could not decrypt session key with bridge RSA key "
+                            "(client keys not swapped? run `gen-cm-key` + "
+                            "`patch_client.py --swap-key`) — plaintext mode")
+        elif self._rsa_key is None:
+            log.warning("no bridge CM RSA key configured — post-handshake "
+                        "frames will be treated as plaintext")
+        # The ChannelEncryptResult goes out plaintext; the client only arms its
+        # filter after receiving it (CMClient.HandleEncryptResult), so we arm
+        # ours after sending it too.
         result = struct.pack("<i", 1)  # EResult.OK
         self.writer.write(encode_handshake(emsg.ChannelEncryptResult, result))
         await self.writer.drain()
@@ -219,16 +267,52 @@ class TranslatorSession:
             await self._send_logon_failure("logon parse failed")
             return
 
-        if not (self.modern and self.modern.is_ready()):
-            await self._send_logon_failure("modern session not ready")
+        # Decrypt the password the client typed into ITS login screen. With the
+        # key-swap applied, CMsgClientLogon.password decrypts with the bridge
+        # key; these are the credentials we forward to the modern servers.
+        password = self._decrypt_logon_password(logon)
+        if password is None:
+            await self._send_logon_failure(
+                "could not decrypt logon password (client keys not swapped?)")
             return
 
+        if not (self.modern and self.modern.is_ready()):
+            if self.modern_factory is not None:
+                creds = Credentials(username=logon.account_name, password=password)
+                auth_code = proto.field_text(84, frame.body) or ""
+                if auth_code:
+                    creds.two_factor_code = auth_code
+                try:
+                    self.modern = await self.modern_factory.get(creds)
+                except Exception as exc:
+                    log.warning("modern login with client credentials failed: %s", exc)
+                    await self._send_logon_failure("modern login failed")
+                    return
+            if not (self.modern and self.modern.is_ready()):
+                await self._send_logon_failure("modern session not ready")
+                return
+
         log.info("legacy logon for %r (password %d bytes, proto msg %d bytes, "
-                 "sha_sentryfile=%s)",
+                 "sha_sentryfile=%s) — forwarding client credentials to modern",
                  logon.account_name, len(logon.password_encrypted), len(frame.body),
                  logon.sha_sentryfile.hex() if logon.sha_sentryfile else "none")
         self.state = State.ACTIVE
         await self._send_logon_success(logon)
+
+    def _decrypt_logon_password(self, logon: _ProtoLogon) -> str | None:
+        """RSA-decrypt the client's password blob.
+
+        With no bridge key configured (simulator / tests) the blob is a
+        stand-in and is passed through as-is.
+        """
+        if not logon.password_encrypted:
+            return ""
+        if self._rsa_key is not None:
+            return cmcrypto.decrypt_password(logon.password_encrypted, self._rsa_key)
+        try:
+            return logon.password_encrypted.decode("utf-8")
+        except UnicodeDecodeError:
+            return None
 
     async def _send_logon_success(self, logon: _ProtoLogon) -> None:
         if self.steam_id == 0:
@@ -456,8 +540,29 @@ class TranslatorSession:
         pass
 
     async def _send_proto(self, emsg_id: int, header: bytes, body: bytes) -> None:
-        self.writer.write(encode_proto(emsg_id, header, body))
+        payload = encode_proto(emsg_id, header, body)
+        # With the channel encrypted, only the post-VT01 data is encrypted
+        # (TcpConnection.ProcessOutgoing); the length prefix + magic stay plain.
+        if self._session_key is not None:
+            inner = cmcrypto.encrypt_payload(payload[4:], self._session_key)
+            payload = struct.pack("<I", len(inner)) + inner
+        self.writer.write(payload)
         await self.writer.drain()
+
+    def decrypt_payload(self, payload: bytes) -> bytes:
+        """Decrypt an inbound frame payload if the channel is encrypted.
+
+        Called by the server's read loop BEFORE decode_frame. The
+        ChannelEncryptResponse itself arrives before the key is established,
+        so it passes through untouched.
+        """
+        if self._session_key is None:
+            return payload
+        try:
+            return cmcrypto.decrypt_payload(payload, self._session_key)
+        except Exception as exc:
+            log.warning("payload decrypt failed (%s) — dropping frame", exc)
+            return payload
 
     async def close(self) -> None:
         try:

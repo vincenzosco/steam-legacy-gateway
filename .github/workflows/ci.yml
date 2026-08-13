@@ -85,6 +85,49 @@ jobs:
           asyncio.run(main())
           EOF
 
+      - name: Run ENCRYPTED end-to-end handshake (credentials from the client)
+        # The real-client path: session key + logon password RSA-encrypted to
+        # the bridge's CM key, channel AES-encrypted. Proves the key-swap flow
+        # end to end without a Lion machine.
+        run: |
+          python - <<'EOF'
+          import asyncio, tempfile
+          from pathlib import Path
+          from gateway.cm import crypto as cmcrypto
+          from gateway.cm.server import run_cm_server
+          from gateway.cm.sim_client import run_handshake
+
+          class _Modern:
+              def is_ready(self):
+                  return True
+              def steam_id(self):
+                  return 76561197960265728
+
+          async def main():
+              key_path = Path(tempfile.mkdtemp()) / "cm-rsa.key"
+              cmcrypto.load_or_create_cm_key(key_path)
+              cfg = {"cm": {"listen_ports": [0], "capture_dir": "",
+                            "sentry_store": "", "rsa_key": str(key_path)},
+                     "account": {}, "gateway_ip": "127.0.0.1"}
+              servers = await run_cm_server(cfg, _Modern(), None)
+              port = servers[0].sockets[0].getsockname()[1]
+              res = await run_handshake(
+                  "127.0.0.1", port, account="ciuser",
+                  encrypted=True, key_pem=str(key_path),
+                  password_text="ci-secret")
+              assert res.channel_result == 1, "channel encrypt refused"
+              assert res.logon_eresult == 1, "logon refused"
+              assert res.sentry_sha, "MachineAuth sentry exchange missing"
+              assert res.login_key_unique_id is not None, "login key missing"
+              print("ENCRYPTED E2E OK: channel=%s logon=%s sentry=%s" % (
+                  res.channel_result, res.logon_eresult,
+                  res.sentry_sha.hex()[:12]))
+              for s in servers:
+                  s.close()
+
+          asyncio.run(main())
+          EOF
+
       - name: Upload handshake capture
         uses: actions/upload-artifact@v4
         with:

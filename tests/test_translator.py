@@ -235,6 +235,100 @@ def test_client_request_machine_auth_echoes_job():
     assert stored is not None and stored.sha_file == sha
 
 
+def test_encrypted_channel_decrypts_session_key_and_password():
+    """With the bridge RSA key installed, the client's encrypted logon is
+    readable: RSA-decrypt the session key, AES-decrypt the channel, RSA-decrypt
+    the password — the credentials come from the client's login screen."""
+    import asyncio
+    import os
+
+    from cryptography.hazmat.primitives.asymmetric import padding as rsa_padding
+
+    from gateway.cm import crypto as cmcrypto
+
+    key = cmcrypto.generate_cm_key()
+    session_key = os.urandom(32)
+    s = _session()
+    s._rsa_key = key
+
+    # 1. client -> server: ChannelEncryptResponse carrying a REAL RSA blob
+    enc_key = key.public_key().encrypt(session_key, rsa_padding.PKCS1v15())
+    body = (struct.pack("<ii", 1, len(enc_key)) + enc_key
+            + struct.pack("<II", 0, 0))
+    frame = decode_frame(
+        b"VT01" + struct.pack("<I", emsg.ChannelEncryptResponse)
+        + struct.pack("<QQ", 0, 0) + body
+    )
+    asyncio.run(s.handle(frame))
+    assert s.state.value == "channel_open"
+    assert s._session_key == session_key
+
+    # 2. ChannelEncryptResult itself went out PLAINTEXT (filter arms after)
+    raw = bytes(s.writer.data)
+    result_payload = raw[4:]
+    assert result_payload.startswith(b"VT01")
+    (emsg_id,) = struct.unpack_from("<I", result_payload, 4)
+    assert emsg_id == emsg.ChannelEncryptResult
+
+    # 3. encrypted ClientLogon: password RSA-encrypted like the real client
+    s.modern = _FakeModern()
+    password_blob = key.public_key().encrypt(
+        b"bridge-secret", rsa_padding.PKCS1v15())
+    logon = (
+        proto.varint_field(1, 65542)
+        + proto.string_field(50, "simuser")
+        + proto.bytes_field(51, password_blob)
+    )
+    plain_payload = (b"VT01" + struct.pack("<I", emsg.ClientLogon | PROTO_FLAG)
+                     + struct.pack("<I", 0) + logon)
+    wire = cmcrypto.encrypt_payload(plain_payload, session_key)
+    frame = decode_frame(cmcrypto.decrypt_payload(wire, session_key))
+    asyncio.run(s.handle(frame))
+    assert s.state == State.ACTIVE
+
+    # 4. every post-logon outbound frame is AES-encrypted with the session key
+    outbound = bytes(s.writer.data)[len(raw):]
+    emitted = []
+    rest = outbound
+    while rest:
+        (size,) = struct.unpack_from("<I", rest, 0)
+        payload = rest[4:4 + size]
+        f = decode_frame(cmcrypto.decrypt_payload(payload, session_key))
+        emitted.append(f.emsg)
+        rest = rest[4 + size:]
+    assert emitted[0] == emsg.ClientLogOnResponse
+    assert emsg.ClientSessionToken in emitted
+    assert emsg.ClientUpdateMachineAuth in emitted
+    assert emsg.ClientNewLoginKey in emitted
+
+
+def test_logon_password_undecryptable_is_refused():
+    import asyncio
+
+    from gateway.cm import crypto as cmcrypto
+
+    key = cmcrypto.generate_cm_key()
+    s = _session()
+    s._rsa_key = key
+    s.state = State.CHANNEL_OPEN
+    # Client still encrypts to Valve's key -> we cannot decrypt it.
+    logon = (
+        proto.varint_field(1, 65542)
+        + proto.string_field(50, "simuser")
+        + proto.bytes_field(51, b"\x00" * 128)
+    )
+    frame = decode_frame(
+        b"VT01" + struct.pack("<I", emsg.ClientLogon | PROTO_FLAG)
+        + struct.pack("<I", 0) + logon
+    )
+    asyncio.run(s.handle(frame))
+    raw = bytes(s.writer.data)
+    assert raw
+    reply = decode_frame(raw[4:])
+    assert reply.emsg == emsg.ClientLogOnResponse
+    assert proto.field_varint(1, reply.body) == 3  # not EResult.OK
+
+
 def test_encode_variants_roundtrip():
     legacy = encode_legacy(emsg.ClientHeartBeat, b"hb")
     f1 = decode_frame(legacy[4:])

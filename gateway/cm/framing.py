@@ -132,8 +132,15 @@ def decode_frame(payload: bytes) -> Frame:
     return Frame(emsg=emsg, body=payload[4:], proto=False, raw=payload)
 
 
-async def read_frame(reader: asyncio.StreamReader) -> Frame | None:
-    """Read one length-prefixed frame from the stream. Returns None on clean EOF."""
+async def read_frame(reader: asyncio.StreamReader, decrypt=None,
+                     on_raw=None) -> Frame | None:
+    """Read one length-prefixed frame from the stream. Returns None on clean EOF.
+
+    `decrypt` (optional) is applied to the payload before decoding — used by
+    the CM server once the channel session key is established. `on_raw`
+    (optional) receives the exact wire bytes (length prefix + payload) for
+    capture/analysis, before any decryption.
+    """
     try:
         size_bytes = await reader.readexactly(4)
     except asyncio.IncompleteReadError:
@@ -144,4 +151,8 @@ async def read_frame(reader: asyncio.StreamReader) -> Frame | None:
     if size > _MAX_FRAME:
         raise FramingError(f"frame too large: {size}")
     payload = await reader.readexactly(size)
+    if on_raw is not None:
+        on_raw(size_bytes + payload)
+    if decrypt is not None:
+        payload = decrypt(payload)
     return decode_frame(payload)

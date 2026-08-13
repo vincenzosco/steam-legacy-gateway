@@ -58,9 +58,13 @@ echo "=== hardcoded CM IPs (bypass DNS!) ==="
 strings -a "$MACOS/steamclient.dylib" | grep -aE '[0-9]{1,3}(\\.[0-9]{1,3}){3}:[0-9]{4,5}' | sort -u | head -10
 
 echo
-echo "=== embedded crypto keys? (whole bundle raw scan) ==="
-# Uses the exact EUniverse.Public DER from 2015-era SteamKit KeyDictionary.
-if python3 scripts/_scan_key.py "$MACOS"; then
+echo "=== embedded crypto keys? (whole-bundle multi-format scan) ==="
+# scripts/_scan_key.py hunts every SteamKit universe key in every plausible
+# format (DER, raw modulus BE/LE, XOR/word-swap obfuscations, base64/hex,
+# CAPI blobs, XML/PEM markers). Known result: the keys are embedded as
+# hex-ASCII DER strings in two tables in steamclient.dylib + single copies in
+# five other binaries (see docs/PROTOCOL_ANALYSIS.md §2.3).
+if python3 scripts/_scan_key.py "$APP"; then
   :
 else
   echo "(scripts/_scan_key.py needs the client at client/Steam.app)"
