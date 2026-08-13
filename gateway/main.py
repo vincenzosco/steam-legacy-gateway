@@ -82,8 +82,10 @@ async def _run_services(cfg: dict, *, run_cm: bool, run_content: bool,
                                 preset=modern)
     else:
         log.warning("No account in config — the bridge will use the credentials "
-                    "the client types into its login screen. Run `gen-cm-key` and "
-                    "swap the key into the client so the logon can be decrypted.")
+                    "the client types into its login screen (one modern session "
+                    "per account, so several users can share the bridge). Run "
+                    "`gen-cm-key` and swap the key into the client so the logon "
+                    "can be decrypted.")
         factory = ModernFactory(cfg, cfg["cm"].get("modern_cm_host", ""))
 
     if run_tls:
@@ -103,8 +105,8 @@ async def _run_services(cfg: dict, *, run_cm: bool, run_content: bool,
     for server in servers:
         server.close()
     await asyncio.gather(*(s.wait_closed() for s in servers), return_exceptions=True)
-    if modern:
-        await modern.stop()
+    if factory is not None:
+        await factory.close()
 
 
 def _cmd_hosts(args: argparse.Namespace) -> int:

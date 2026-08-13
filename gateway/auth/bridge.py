@@ -45,6 +45,6 @@ def resolve_guard_code(credentials: Credentials) -> Credentials:
         log.info("Non-interactive run and no Steam Guard code configured; "
                  "the modern login will fail unless the account needs no guard.")
         return credentials
-    code = input("Steam Guard code: ").strip()
+    code = input(f"Steam Guard code for {credentials.username}: ").strip()
     credentials.two_factor_code = code or None
     return credentials

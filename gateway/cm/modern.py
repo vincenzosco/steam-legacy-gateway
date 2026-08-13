@@ -1,9 +1,10 @@
-"""Modern back-end: one modern Steam session owned by the gateway.
+"""Modern back-end: modern Steam sessions owned by the gateway.
 
-ValvePython/steam is built on gevent, so it cannot live inside the asyncio
-event loop. We run it in a dedicated thread and bridge events back over an
-asyncio queue using `call_soon_threadsafe`. If the `steam` package is missing,
-the session fails fast with a clear message (the rest of the gateway still runs).
+One ModernSession per account (see ModernFactory): each runs ValvePython/steam
+in its own dedicated thread, so several different users on several Lion
+machines can share one bridge. Events are bridged back over an asyncio queue
+using `call_soon_threadsafe`. If the `steam` package is missing, a session
+fails fast with a clear message (the rest of the gateway still runs).
 """
 from __future__ import annotations
 
@@ -36,7 +37,11 @@ class ModernSession:
         self._loop = asyncio.get_running_loop()
         self._ready = self._loop.create_future()
         self._events = asyncio.Queue()
-        self._thread = threading.Thread(target=self._run, name="modern-steam", daemon=True)
+        self._thread = threading.Thread(
+            target=self._run,
+            name=f"modern-steam-{self.credentials.username}",
+            daemon=True,
+        )
         self._thread.start()
         await self._ready
         log.info("modern session ready (%s)", self.credentials.username)
@@ -150,15 +155,22 @@ class ModernSession:
 
 
 class ModernFactory:
-    """Builds the shared modern session lazily, from legacy client credentials.
+    """Builds modern sessions lazily, from legacy client credentials.
 
-    This is the 'credentials from the client's login screen' path: the first
-    legacy ClientLogon that reaches the bridge supplies the username/password
-    (decrypted via the swapped CM key) and the modern session logs in with
+    This is the 'credentials from the client's login screen' path: a legacy
+    ClientLogon reaches the bridge with a username/password (decrypted via the
+    swapped CM key) and the modern session for that account logs in with
     exactly those — no credentials in config/gateway.local.yaml.
 
+    One session per distinct account: the first logon for a username creates
+    (and logs in) that account's session; later logons for the same username
+    reuse it. Different usernames get different sessions, each in its own
+    thread — so several users can share one bridge. A failed login is never
+    cached, so the next attempt retries.
+
     If the operator configured account.* (or env vars) at boot, `preset` is
-    that pre-started session and client credentials are ignored.
+    that pre-started session and every connection rides on it (single-account
+    mode — the translator refuses logons for any other account).
     """
 
     def __init__(self, cfg: dict, modern_cm_host: str = "",
@@ -166,24 +178,44 @@ class ModernFactory:
         self.cfg = cfg
         self.modern_cm_host = modern_cm_host
         self.preset = preset
-        self._session: ModernSession | None = None
+        self._sessions: dict[str, ModernSession] = {}
         self._lock = asyncio.Lock()
 
     async def get(self, credentials: Credentials) -> ModernSession | None:
-        """Return the shared modern session, creating + logging in on first use."""
+        """Return the modern session for these credentials, logging in on first use.
+
+        Sessions are keyed by username: the same account always gets the same
+        session (so two machines on one account share a single modern login);
+        different accounts get independent sessions.
+        """
         if self.preset is not None:
             return self.preset
         async with self._lock:
-            if self._session is None:
-                session = ModernSession(credentials, self.modern_cm_host)
-                try:
-                    await session.start()
-                except Exception as exc:
-                    log.error("modern login failed for %r: %s",
-                              credentials.username, exc)
-                    return None
-                self._session = session
-            return self._session
+            session = self._sessions.get(credentials.username)
+            if session is not None:
+                return session
+            session = ModernSession(credentials, self.modern_cm_host)
+            try:
+                await session.start()
+            except Exception as exc:
+                log.error("modern login failed for %r: %s",
+                          credentials.username, exc)
+                return None
+            self._sessions[credentials.username] = session
+            return session
+
+    async def close(self) -> None:
+        """Stop the preset and every pooled modern session."""
+        sessions: list[ModernSession] = []
+        if self.preset is not None:
+            sessions.append(self.preset)
+        async with self._lock:
+            sessions.extend(self._sessions.values())
+        for session in sessions:
+            try:
+                await session.stop()
+            except Exception as exc:
+                log.warning("error stopping modern session: %s", exc)
 
     def _on_error(self, error: Exception) -> None:
         self._emit({"type": "error", "error": str(error)})

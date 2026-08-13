@@ -67,7 +67,11 @@ python -m gateway gen-cm-key                     # bridge keypair (once)
 
 If you *do* set `account.username` / `account.password` (or the
 `STEAM_USERNAME` / `STEAM_PASSWORD` env vars), the bridge uses those instead
-— the client-supplied credentials are ignored. `config/gateway.local.yaml` is
+— the client-supplied credentials are ignored, and only that one account can
+log in (logons for any other account are refused). Leave `account.*` empty to
+serve **multiple users**: each Lion machine logs in with its own credentials
+and the bridge gives each account its own modern session. Two machines on the
+same account share a single modern login. `config/gateway.local.yaml` is
 gitignored either way.
 
 ### 4. Generate certificates

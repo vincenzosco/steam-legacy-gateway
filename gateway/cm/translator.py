@@ -129,7 +129,12 @@ def _server_key() -> rsa.RSAPrivateKey:
 
 
 class TranslatorSession:
-    """One legacy CM connection, translated onto the shared modern session."""
+    """One legacy CM connection, translated onto its account's modern session.
+
+    Each connection runs its own state machine; the modern session it rides on
+    is the one for the account in the ClientLogon (per-user pool in
+    ModernFactory), so several users can be logged in at once.
+    """
 
     def __init__(self, writer: asyncio.StreamWriter, cfg: dict,
                  modern: ModernSession | None, sentry_store=None,
@@ -276,21 +281,31 @@ class TranslatorSession:
                 "could not decrypt logon password (client keys not swapped?)")
             return
 
-        if not (self.modern and self.modern.is_ready()):
-            if self.modern_factory is not None:
-                creds = Credentials(username=logon.account_name, password=password)
-                auth_code = proto.field_text(84, frame.body) or ""
-                if auth_code:
-                    creds.two_factor_code = auth_code
-                try:
-                    self.modern = await self.modern_factory.get(creds)
-                except Exception as exc:
-                    log.warning("modern login with client credentials failed: %s", exc)
-                    await self._send_logon_failure("modern login failed")
-                    return
-            if not (self.modern and self.modern.is_ready()):
-                await self._send_logon_failure("modern session not ready")
+        if self.modern is not None and self.modern.is_ready():
+            # Single-account mode (account.* in config): the pre-started
+            # session serves only the account it was logged in as.
+            preset_user = getattr(self.modern, "credentials", None)
+            if preset_user is not None and preset_user.username != logon.account_name:
+                log.warning("logon for %r refused: bridge's modern session is "
+                            "configured for %r only",
+                            logon.account_name, preset_user.username)
+                await self._send_logon_failure("bridge configured for a different account")
                 return
+        elif self.modern_factory is not None:
+            # Multi-user mode: fetch (or create) the session for THIS account.
+            creds = Credentials(username=logon.account_name, password=password)
+            auth_code = proto.field_text(84, frame.body) or ""
+            if auth_code:
+                creds.two_factor_code = auth_code
+            try:
+                self.modern = await self.modern_factory.get(creds)
+            except Exception as exc:
+                log.warning("modern login with client credentials failed: %s", exc)
+                await self._send_logon_failure("modern login failed")
+                return
+        if not (self.modern and self.modern.is_ready()):
+            await self._send_logon_failure("modern session not ready")
+            return
 
         log.info("legacy logon for %r (password %d bytes, proto msg %d bytes, "
                  "sha_sentryfile=%s) — forwarding client credentials to modern",

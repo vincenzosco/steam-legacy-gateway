@@ -75,7 +75,12 @@ python -m gateway gen-cm-key
   embedded slot (Valve's own keys use e=17; see PROTOCOL_ANALYSIS §2.3). The
   channel is home-LAN only and the modern login rides on TLS.
 - If the modern server asks for a Steam Guard code, the bridge prompts on its
-  console (run it in the foreground, or set `STEAM_GUARD_CODE`).
+  console, naming the account (run it in the foreground, or set `STEAM_GUARD_CODE`).
+- **Multiple users**: one modern session per account — each person on their own
+  Lion machine logs in with their own credentials and gets an independent
+  session (each in its own thread). Two machines on the same account share a
+  single modern login. With `account.*` in the config the bridge serves that
+  one account only and refuses logons for anyone else.
 - Revert with `./scripts/patch_client.py --restore`.
 
 ## Legal / account-risk disclaimer

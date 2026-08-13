@@ -112,6 +112,66 @@ class _FakeModern:
         return 76561197960265728  # steamid for simuser's universe/type base
 
 
+def test_logon_binds_factory_session_for_the_account():
+    """In multi-user mode the logon goes through the factory, which resolves
+    the session for the logged-in account (not a shared one)."""
+    import asyncio
+
+    s = _session()
+    s.state = State.CHANNEL_OPEN
+
+    class _FakeFactory:
+        def __init__(self):
+            self.calls: list[str] = []
+
+        async def get(self, creds):
+            self.calls.append(creds.username)
+            return _FakeModern()
+
+    factory = _FakeFactory()
+    s.modern_factory = factory
+    logon = (
+        proto.varint_field(1, 65542)
+        + proto.string_field(50, "simuser")
+        + proto.bytes_field(51, b"\x00" * 128)
+    )
+    frame = decode_frame(
+        b"VT01" + struct.pack("<I", emsg.ClientLogon | PROTO_FLAG)
+        + struct.pack("<I", 0) + logon
+    )
+    asyncio.run(s.handle(frame))
+    assert factory.calls == ["simuser"]
+    assert isinstance(s.modern, _FakeModern)
+    assert s.state == State.ACTIVE
+
+
+def test_preset_logon_for_another_account_is_refused():
+    """Single-account mode: a logon for a different account is refused rather
+    than silently served through the preset session."""
+    import asyncio
+
+    s = _session()
+    s.state = State.CHANNEL_OPEN
+    preset = _FakeModern()
+    preset.credentials = type("C", (), {"username": "owner"})()
+    s.modern = preset
+    logon = (
+        proto.varint_field(1, 65542)
+        + proto.string_field(50, "intruder")
+        + proto.bytes_field(51, b"\x00" * 128)
+    )
+    frame = decode_frame(
+        b"VT01" + struct.pack("<I", emsg.ClientLogon | PROTO_FLAG)
+        + struct.pack("<I", 0) + logon
+    )
+    asyncio.run(s.handle(frame))
+    raw = bytes(s.writer.data)
+    reply = decode_frame(raw[4:])
+    assert reply.emsg == emsg.ClientLogOnResponse
+    assert proto.field_varint(1, reply.body) == 3  # not EResult.OK
+    assert s.state != State.ACTIVE
+
+
 def test_logon_success_runs_machine_auth_flow():
     """After a successful logon the gateway pushes a sentry + login key."""
     import asyncio
