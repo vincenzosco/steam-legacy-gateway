@@ -8,11 +8,13 @@ pieces exist; this file is only *how*.
 
 | Machine | Role | Requirements |
 |---|---|---|
-| **Gateway** (modern Mac or PC, always on) | translates legacy <-> modern | Python 3.9+; `git`; root access (ports 80/443); your Steam account + Steam Guard |
+| **Gateway** (any always-on computer at home — spare Mac, old PC, Raspberry Pi) | translates legacy <-> modern | Python 3.9+; `git`; root access (ports 80/443); your Steam account + Steam Guard |
 | **Lion Mac** (2008–2011 Intel) | runs the old Steam client | OS X 10.7; ~1 GB free; copies of `certs/steam-gateway-ca.crt` and the client |
 
 Both machines on the same LAN. Decide the gateway's IP now and reserve it in the
-router (or use a static IP): `ipconfig getifaddr en0` shows it.
+router (or use a static IP): `ipconfig getifaddr en0` (macOS) or `hostname -I`
+(Linux/Pi) shows it. Keep the bridge running 24/7 with
+[`docs/DEPLOY.md`](DEPLOY.md) (systemd / launchd / Docker).
 
 ---
 
@@ -135,7 +137,26 @@ sudo security add-trusted-cert -d -r trustRoot -k /Library/Keychains/System.keyc
 The old client must trust this CA or it will reject the gateway's TLS
 certificates.
 
-### 3. Point Steam at the gateway
+### 3. Point Steam at the gateway — CM layer (binary patch, recommended)
+
+The client has **hardcoded CM IPs baked into the binary** (e.g.
+`208.64.200.201:27017`) that are tried *without DNS*, so /etc/hosts alone is
+not enough for the CM layer. Rewrite them to the gateway's LAN IP instead
+(74 slots, in-place, one-time backup):
+
+```bash
+# on any modern machine with the extracted client (or on the Lion Mac via USB/NAS copy)
+./scripts/patch_client.py --ip 192.168.1.50            # gateway's LAN IP
+./scripts/patch_client.py --verify --expect 192.168.1.50  # exit 0 only if fully patched
+```
+
+Preview with `--dry-run`; revert with `--restore`. If you patched a copy
+elsewhere, copy `Steam.app` back to the Lion Mac afterwards.
+
+### 4. Point Steam at the gateway — TLS hosts (hosts file)
+
+The hosts block is still needed for the **TLS/HTTPS hosts** (store, api,
+community — the CM layer is handled by the binary patch above).
 
 **Easiest** — generate the block on the gateway, paste it on the Lion Mac:
 
@@ -153,12 +174,8 @@ sudo ./scripts/install_hosts.sh 192.168.1.50
 # undo later with:  sudo ./scripts/install_hosts.sh remove
 ```
 
-### 4. (Troubleshooting) hardcoded CM IPs
-
-The client also has **hardcoded CM IPs baked into the binary** (e.g.
-`208.64.200.201:27017`) that bypass /etc/hosts. If Steam hangs with no
-connection appearing in the gateway logs, add a PF redirect on the Lion Mac so
-those IPs also land on the gateway:
+**Fallback (only if you prefer not to patch the binary):** add a PF redirect
+on the Lion Mac so the hardcoded CM IPs land on the gateway:
 
 ```
 # /etc/pf.conf (append; en0 = your interface, X.X.X.X = gateway IP)
@@ -168,9 +185,6 @@ rdr pass on en0 proto tcp from any to 208.64.200.201 port 27017:27020 -> X.X.X.X
 ```bash
 sudo pfctl -ef /etc/pf.conf
 ```
-
-(The client usually rotates to the DNS-resolved CMs after a failed candidate,
-so you may not need this — but it's there if you do.)
 
 ---
 
@@ -197,13 +211,10 @@ What is **implemented but unverified** (needs a real client + capture):
 
 - The CM handshake (server-initiated channel encryption, protobuf logon flow) —
   the wire details carry `VERIFY-BY-CAPTURE` notes in the code
-- Whether the channel session key can be decrypted by the gateway at all (the
-  embedded-key question — the single most important unknown)
 
-What is **missing** (see PROTOCOL_ANALYSIS.md §3): Steam Guard MachineAuth,
-app-info/license data (the library stays empty), friends/chat, game-launch
-session tickets, and the modern store/community pages (old WebKit can't render
-them — a dead end).
+What is **missing** (see PROTOCOL_ANALYSIS.md §3): app-info/license data (the
+library stays empty), friends/chat, game-launch session tickets, and the
+modern store/community pages (old WebKit can't render them — a dead end).
 
 So: expect the handshake to *start* on the wire, but a full
 logon + playable library is not there yet. The gateway's value today is the
@@ -215,7 +226,7 @@ verified plumbing plus the analysis that tells you exactly what's left.
 |---|---|
 | `Permission denied` binding :80/:443 | run with `sudo` |
 | `steam` not installed | `pip install steam` in the venv |
-| Client hangs with no CM connection in logs | add the PF redirect (Part B §4) |
+| Client hangs with no CM connection in logs | patch the binary: `./scripts/patch_client.py --ip <gateway-ip>` (Part B §3); PF redirect only as fallback |
 | TLS errors in the client | CA not trusted on Lion (Part B §2) |
 | Client auto-updated itself | re-extract and re-freeze (`Steam.cfg`) |
 | Warnings about `--no-modern` / no account | configure `account.*` (Part A §3) |

@@ -1,155 +1,238 @@
-# Deploying the bridge 24/7 (with GitHub Actions)
+# Running the bridge at home (24/7)
 
-The end goal of this project is a Lion Mac running a **patched** Steam client
-that connects to a **bridge** — the bridge translates the 2015 CM protocol to
-modern Valve servers. The bridge is a long-running TCP server (ports
-27017-27020 CM, 443/80 TLS, 18081 content origin), so it needs a machine that
-is on 24/7.
+The bridge is a long-running server (CM on TCP 27017-27020, TLS on 443/80,
+content origin on 18081). It needs a machine that is on 24/7 — but it does
+**not** need a rented VM or a public IP. The recommended setup is a second
+computer in your home, on the same LAN as the Lion Mac.
 
-## Can GitHub Actions host it? No — but it can deploy it
+## Why home works (and what the GitHub Actions path is for)
 
-GitHub-hosted runners are **ephemeral**: a job runs for at most ~6 hours, then
-the VM is destroyed, and runners accept **no inbound connections**. A 24/7
-bridge cannot live on a GitHub runner.
-
-What GitHub Actions *is* great at here:
-
-1. **CI** — run the test suite + a live gateway→simulator handshake on every
-   push/PR (`.github/workflows/ci.yml`).
-2. **Deploy** — ship the bridge to a real VM you control and keep it running
-   under systemd, then publish the VM's public IP into the repo
-   (`.github/workflows/deploy.yml`).
-3. **End-to-end** — the "IP from GitHub Actions": after deployment the
-   workflow writes the host's public IP to `deploy/endpoint.txt`, and
-   `scripts/patch_client.py` hardcodes exactly that IP into the Steam client.
+- The bridge talks to Valve **outbound** (it owns the modern login via
+  ValvePython/steam), so it works from any home NAT — **no inbound ports,
+  no port forwarding, no static public IP**.
+- The Lion client is pointed at the bridge's **LAN IP** (e.g. `192.168.1.50`)
+  with `scripts/patch_client.py`, which rewrites the client's built-in CM
+  server list — no DNS involvement for the CM layer at all.
+- **GitHub Actions** is used for **CI only** by default: the test suite plus a
+  live gateway → simulator handshake run on every push
+  (`.github/workflows/ci.yml`), so you never need a VM to develop or use the
+  project.
+- The **only** reason to add a VM is if the Lion Mac is *not* on the same LAN
+  as the bridge (you want to reach it remotely). That optional path is
+  described at the bottom.
 
 ```
-[Lion Mac — patched Steam client]
-   │  hardcoded CM list -> <deploy/endpoint.txt>:27017-27020   (no /etc/hosts needed)
+[Lion Mac — Steam 1.0.x]
+   │  patched CM list  -> 192.168.1.50:27017-27020   (patch_client.py, no DNS)
+   │  hosts file       -> *.steampowered.com, cm*, content hosts -> 192.168.1.50
    ▼
-[Your VM — 24/7, deployed by GitHub Actions]
-   ├─ steam-gateway.service (systemd, Restart=always)
-   ├─ CM translator 27017-27020, TLS 443/80, content origin
-   └─ owns the modern login (ValvePython/steam)
+[Home bridge — spare Mac/PC/Pi, always on]
+   │  (outbound only — nothing to open in your router)
    ▼
 [Valve servers]
 ```
 
-## 1. Get a VM
+## 0. Decide on the machine and its LAN IP
 
-Any always-on server with a public IPv4 works. Examples:
+Any always-on computer works: a spare modern Mac, an old PC, or a Raspberry
+Pi 4+. Requirements: Python 3.9+ (the docs assume 3.10+), `git`, and root
+access (ports 80/443 are privileged).
 
-- Oracle Cloud **free tier** (2× Ampere ARM VMs, always-free)
-- Hetzner CX22 (~€4/mo), DigitalOcean basic droplet (~$4-6/mo)
-- A Raspberry Pi behind a router with port-forwarding (needs a static IP/DNS)
-
-Requirements: Ubuntu 22.04+ (or any distro with python3.11+), a public IP,
-and **inbound TCP on 27017-27020, 443, 80** (see firewall note below).
-
-## 2. Configure secrets
-
-In the repo → Settings → Secrets and variables → Actions → New repository
-secret:
-
-| Secret | Value |
-|---|---|
-| `DEPLOY_HOST` | the VM's SSH hostname or IP |
-| `DEPLOY_USER` | SSH user (e.g. `ubuntu`) |
-| `DEPLOY_SSH_KEY` | the **private** SSH key (ed25519 recommended) |
-| `DEPLOY_PORT` | SSH port (default `22`; set if custom) |
-
-## 3. Configure the account (optional but recommended)
-
-The gateway owns the modern login. Create `config/gateway.local.yaml`
-(gitignored) on the VM after first deploy, or pass credentials as env vars in
-the systemd unit:
-
-```ini
-Environment=STEAM_USERNAME=you
-Environment=STEAM_PASSWORD=secret
-```
-
-Without credentials the bridge still runs and completes the handshake, but
-legacy logons are refused.
-
-## 4. Firewall (VM side)
+Give the bridge a **fixed LAN IP** (router DHCP reservation or static):
 
 ```bash
-sudo ufw allow 27017:27020/tcp   # legacy CM listener
-sudo ufw allow 443/tcp           # TLS forwarder
-sudo ufw allow 80/tcp            # plain-HTTP forwarder (optional)
+ipconfig getifaddr en0     # macOS — the bridge's own IP
+hostname -I                # Linux / Raspberry Pi
 ```
 
-If the provider has a cloud security group (Oracle, AWS, GCP), open the same
-ports there too.
+Note that IP — the Lion client will be patched to it.
 
-## 5. Deploy
-
-1. Run the **Deploy bridge (24/7)** workflow (Actions tab → Deploy bridge →
-   Run workflow). This:
-   - rsyncs the repo to `/opt/steam-legacy-gateway` on the VM
-   - installs Python deps into a venv
-   - installs + enables `steam-gateway.service` (auto-restart, survives reboot)
-   - reads the VM's public IP (`api.ipify.org`) and commits it to
-     `deploy/endpoint.txt`
-2. Check the run summary for the IP, or read `deploy/endpoint.txt`.
-
-## 6. Hardcode the IP into the Steam client
-
-On the machine that has the extracted client (or fetch it with
-`scripts/fetch_steam_client.sh` first):
+## 1. Install on the bridge machine
 
 ```bash
-./scripts/patch_client.py --endpoint-file deploy/endpoint.txt
-# or: ./scripts/patch_client.py --ip 203.0.113.7
+git clone https://github.com/vincenzosco/steam-legacy-gateway.git
+cd steam-legacy-gateway
+python3 -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
+cp config/gateway.yaml config/gateway.local.yaml   # edit: gateway_ip + account
+python -m gateway gen-certs                        # local CA + per-host certs
 ```
 
-This rewrites the client's built-in CM server list (74 address slots in
-`steamclient.dylib`) so it connects straight to the bridge — **no /etc/hosts
-edit required for the CM layer**. Preview with `--dry-run`, revert with
-`--restore`, confirm with `--verify --expect <IP>` (exits 0 only when every
-CM slot points at the bridge).
+Edit `config/gateway.local.yaml` (gitignored — credentials never get
+committed):
 
-### Client-side notes
+```yaml
+gateway_ip: 192.168.1.50       # the bridge's LAN IP from step 0
+account:
+  username: "your-steam-login"
+  password: "your-password"
+  steam_guard: ""              # leave empty to be prompted at first login
+```
 
-- The patch only replaces strings that fit (same length or shorter); with a
-  typical IPv4 like `203.0.113.7` every slot fits.
-- macOS may complain about the invalidated code signature. Re-sign ad-hoc:
-  `codesign -f -s - steamclient.dylib` (Lion doesn't enforce signatures for
-  locally-run apps, but it silences the warning).
-- TLS/HTTPS hosts (store, api, community) are still handled by the DNS layer —
-  either the hosts-file block from `scripts/install_hosts.sh` or a DNS server
-  pointing those names at the bridge VM.
-
-## Manual deploy (no GitHub Actions)
+Sanity check before making it a service:
 
 ```bash
-rsync -az --exclude client --exclude content-cache --exclude certs --exclude .git \
-  ./ user@vm:/opt/steam-legacy-gateway/
-ssh user@vm 'cd /opt/steam-legacy-gateway && python3 -m venv .venv && \
-  ./.venv/bin/pip install -r requirements.txt'
+python -m pytest tests/ -q
+./scripts/smoke_tls.sh         # forwards a real request to Valve through the proxy
+sudo python -m gateway run     # Ctrl-C when you see all four services up
+```
+
+## 2. Keep it running 24/7
+
+### Option A — systemd (Linux / Raspberry Pi)
+
+```bash
 sudo cp deploy/steam-gateway.service /etc/systemd/system/
-sudo systemctl daemon-reload && sudo systemctl enable --now steam-gateway.service
+# cloned somewhere other than /opt/steam-legacy-gateway? fix the paths:
+sudo sed -i 's#/opt/steam-legacy-gateway#/home/pi/steam-legacy-gateway#g' \
+  /etc/systemd/system/steam-gateway.service
+sudo systemctl daemon-reload
+sudo systemctl enable --now steam-gateway.service
+systemctl status steam-gateway.service     # should print "active (running)"
 ```
 
-## Container alternative
+The unit sets `Restart=always` and `WantedBy=multi-user.target`, so the
+bridge comes back automatically after crashes and reboots. Logs:
+`sudo journalctl -u steam-gateway.service -f`.
 
-A Dockerfile is included for container-first setups:
+### Option B — launchd (macOS bridge)
+
+Save this as `/tmp/com.steamlegacygateway.bridge.plist` (fix the two
+`/Users/you/...` paths), then load it:
+
+```xml
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.steamlegacygateway.bridge</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/Users/you/steam-legacy-gateway/.venv/bin/python</string>
+    <string>-m</string>
+    <string>gateway</string>
+    <string>run</string>
+  </array>
+  <key>WorkingDirectory</key>
+  <string>/Users/you/steam-legacy-gateway</string>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <true/>
+</dict>
+</plist>
+```
+
+```bash
+sudo cp /tmp/com.steamlegacygateway.bridge.plist /Library/LaunchDaemons/
+sudo launchctl load /Library/LaunchDaemons/com.steamlegacygateway.bridge.plist
+# logs: sudo log show --predicate 'process == "Python"' --last 1h
+```
+
+(It's a LaunchDaemon, so it runs as root and can bind 80/443. It survives
+reboots via `RunAtLoad`.)
+
+### Option C — Docker
 
 ```bash
 docker build -t steam-legacy-gateway .
 docker run -d --name gateway --network host \
   -e STEAM_USERNAME=you -e STEAM_PASSWORD=secret \
-  -v $(pwd)/config:/app/config steam-legacy-gateway
+  -v $(pwd)/config:/app/config \
+  steam-legacy-gateway
 ```
+
+`--network host` exposes 27017-27020/443/80 directly, which the CM + TLS
+listeners need.
+
+### Option D — dev / foreground
+
+```bash
+sudo python -m gateway run        # or: python -m gateway run --cm-only (no root)
+```
+
+## 3. Hardcode the bridge into the Steam client
+
+On the Lion Mac (or on any modern machine against the extracted client, then
+copy `Steam.app` back), point the client's built-in CM table at the bridge:
+
+```bash
+./scripts/patch_client.py --ip 192.168.1.50              # bridge's LAN IP
+./scripts/patch_client.py --verify --expect 192.168.1.50 # exit 0 only if fully patched
+```
+
+This rewrites all 74 hardcoded CM address slots in `steamclient.dylib` in
+place (same-length-or-shorter only, NUL-padded, one-time backup at
+`steamclient.dylib.orig`). Preview with `--dry-run`, revert with `--restore`.
+
+- The CM layer now needs **no** `/etc/hosts` entries and no PF redirect.
+- The hosts file is still used for the **TLS hosts** (store, api, community) —
+  install it with `sudo ./scripts/install_hosts.sh 192.168.1.50` (Part B of
+  `docs/SETUP.md`).
+- macOS may warn about the invalidated code signature; silence it with
+  `codesign -f -s - steamclient.dylib` (Lion does not enforce signatures for
+  locally-run apps).
+
+Then start Steam on the Lion Mac. First run: watch the bridge logs
+(`journalctl -u steam-gateway.service -f` or the launchd log) — you should see
+`legacy CM connection from <lion-ip>`, the channel-encrypt handshake, and the
+Steam Guard prompt if `steam_guard` was left empty.
+
+## Firewall notes
+
+- **Home (recommended):** nothing to open. The bridge only makes outbound
+  connections to Valve; the Lion client reaches it over the LAN.
+- **Only if you forward ports** (e.g. to reach the bridge from outside):
+  TCP 27017-27020 (CM), 443 (TLS), 80 (plain) — and a static public IP or
+  dynamic-DNS hostname.
+
+---
+
+## Optional: expose the bridge to the internet (VM + GitHub Actions)
+
+Only needed if the Lion Mac is not on the same LAN as the bridge. GitHub-hosted
+runners are ephemeral (~6h jobs, no inbound TCP), so they cannot host the
+bridge — but the **Deploy** workflow (`.github/workflows/deploy.yml`) ships it
+to an always-on VM you provide and publishes that VM's public IP into the repo.
+
+1. **Get a VM** with a public IPv4 (Oracle free tier, Hetzner, DigitalOcean,
+   or a Raspberry Pi with port-forwarding). Ubuntu 22.04+ preferred.
+2. **Configure secrets** (repo → Settings → Secrets and variables → Actions):
+   `DEPLOY_HOST` (VM SSH host/IP), `DEPLOY_USER` (e.g. `ubuntu`),
+   `DEPLOY_SSH_KEY` (private key), `DEPLOY_PORT` (default 22).
+3. **Open the firewall** on the VM: `sudo ufw allow 27017:27020/tcp &&
+   sudo ufw allow 443/tcp && sudo ufw allow 80/tcp` (plus the cloud provider's
+   security group).
+4. **Run the workflow**: Actions tab → "Deploy bridge (24/7)" → Run workflow.
+   It rsyncs the code to `/opt/steam-legacy-gateway`, installs the systemd
+   unit, and reads the VM's public IP (`api.ipify.org`), committing it to
+   `deploy/endpoint.txt` (also uploaded as the `bridge-endpoint` artifact and
+   printed in the job summary).
+5. **Patch with the endpoint file instead of `--ip`:**
+
+```bash
+git pull   # gets the committed deploy/endpoint.txt
+./scripts/patch_client.py --endpoint-file deploy/endpoint.txt
+./scripts/patch_client.py --verify --expect "$(cat deploy/endpoint.txt)"
+```
+
+Configure the account on the VM via `config/gateway.local.yaml` or the
+`STEAM_USERNAME` / `STEAM_PASSWORD` env vars in the unit file.
 
 ## Troubleshooting
 
-- `systemctl status steam-gateway.service` on the VM — check the log line
-  `gateway ready`.
-- `sudo journalctl -u steam-gateway.service -f` — live logs.
-- If the old client still tries real Valve CMs, confirm the patch was applied:
+- `systemctl status steam-gateway.service` on the bridge — look for
+  `gateway ready` in the log.
+- `sudo journalctl -u steam-gateway.service -f` — live logs (Linux).
+- Client hangs with no CM connection in the logs: confirm the patch took —
   `./scripts/patch_client.py --verify --expect <bridge-IP>` (exit 0 = fully
   patched; exit 1 with WARN/FAIL = not patched or only partially patched).
-- `python scripts/client_sim.py --host <VM_IP>` — run the simulator against the
-  remote bridge from your machine to confirm it answers.
+- TLS errors in the client: CA not trusted on the Lion Mac (Part B of
+  `docs/SETUP.md`).
+- Client auto-updated itself: re-extract and re-freeze (`Steam.cfg` with
+  `BootStrapperInhibitAll=Enable`) — never let this client update.
+- `python scripts/client_sim.py --host <bridge-IP>` — run the protocol-accurate
+  simulator against the remote bridge to confirm it answers before touching
+  the client.

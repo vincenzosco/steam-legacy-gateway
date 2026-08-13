@@ -41,7 +41,7 @@ against packet captures from a real 2013 client:
 | Legacy CM framing + EMsg layer | complete | renumbered EMsg set (from the binary's own table), VT01 + proto-flag framing, unit-tested |
 | Steam Guard MachineAuth flow | complete | all 6 MachineAuth messages + NewLoginKey pair, job-id targeting, persistent sentry store, integration-tested end-to-end |
 | Modern back-end (ValvePython/steam) | complete; needs your account | install `steam`, set credentials in config |
-| CM translator / message mapping | grounded | see [docs/PROTOCOL_ANALYSIS.md](docs/PROTOCOL_ANALYSIS.md) — channel encrypt + protobuf logon + post-logon set implemented from the binary + 2015-era SteamKit; the AES/session-key question is the remaining capture item |
+| CM translator / message mapping | grounded | see [docs/PROTOCOL_ANALYSIS.md](docs/PROTOCOL_ANALYSIS.md) — channel encrypt + protobuf logon + post-logon set implemented from the binary + 2015-era SteamKit; the session-key story is resolved (keys embedded as hex-ASCII DER, key-swap patch defined — §2.3) |
 | Auth impersonation | structural only | the gateway owns the modern login; legacy session emulation is partial |
 
 **Why the translator can't be finished blind:** the 2013 logon flow involved RSA-encrypted
@@ -57,29 +57,67 @@ Subscriber Agreement: automated or modified clients can get your account flagged
 banned. **Use at your own risk, ideally with an alt account.** Valve can break any part
 of this server-side at any time — that's inherent to the approach.
 
-## Hosting the bridge 24/7 + hardcoding it into the client
+## Hosting the bridge (home-first)
 
-**GitHub Actions can't host a long-running TCP server** (runners are ephemeral
-and accept no inbound connections), but it makes an excellent orchestrator:
+The bridge is designed to run on a **second computer in your home** — a spare
+modern Mac, an old PC, or a Raspberry Pi — always on, on the **same LAN as the
+Lion Mac**. No VM, no port forwarding, no public IP required:
 
-- **CI** (`.github/workflows/ci.yml`) — runs the test suite plus a **live
+```
+[Lion Mac — Steam 1.0.x]
+   │  patched CM list  -> 192.168.1.50:27017-27020   (hardcoded by patch_client.py, no DNS)
+   │  hosts file       -> *.steampowered.com, cm*, content hosts -> 192.168.1.50
+   ▼
+[Home bridge — spare Mac/PC/Pi, always on]
+   │  (outbound only — works from any NAT, nothing to open in your router)
+   ▼
+[Valve servers]
+```
+
+- **The bridge reaches Valve outbound**, so you open **no inbound ports** and
+  need no static public IP. The Lion client is pointed at the bridge's **LAN
+  IP** (e.g. `192.168.1.50`) instead of Valve's servers.
+- **CI** (`.github/workflows/ci.yml`) runs the test suite plus a **live
   gateway → simulator handshake** (channel encrypt + logon + Steam Guard
-  MachineAuth) on every push/PR.
-- **Deploy** (`.github/workflows/deploy.yml`) — ships the bridge to a VM you
-  control, runs it under systemd (`Restart=always`, survives reboot), then
-  publishes the VM's public IP to `deploy/endpoint.txt` — *the* address.
-- **Client patch** (`scripts/patch_client.py`) — rewrites the Steam client's
-  built-in CM server list in place so it connects straight to that IP:
+  MachineAuth) on every push — you don't need a VM or GitHub Actions at all to
+  use the project.
+- **Keeping it running 24/7** — install it as a service and it survives
+  reboots (`Restart=always`):
   ```bash
-  ./scripts/patch_client.py --endpoint-file deploy/endpoint.txt   # IP from GH Actions
-  ./scripts/patch_client.py --dry-run --ip 203.0.113.7            # preview
-  ./scripts/patch_client.py --verify --expect 203.0.113.7         # confirm (exit 0 only if fully patched)
-  ./scripts/patch_client.py --restore                             # revert
+  sudo cp deploy/steam-gateway.service /etc/systemd/system/
+  sudo systemctl daemon-reload && sudo systemctl enable --now steam-gateway.service
   ```
-  No `/etc/hosts` edit needed for the CM layer — the hardcoded addresses are
-  what the client tries first (and they bypass DNS entirely).
+  (if you cloned somewhere other than `/opt/steam-legacy-gateway`, fix the two
+  paths in the unit first — see `docs/DEPLOY.md`)
+  launchd (macOS) and Docker variants are in [`docs/DEPLOY.md`](docs/DEPLOY.md).
 
-Full deployment guide: [`docs/DEPLOY.md`](docs/DEPLOY.md).
+### Point the client at the bridge
+
+```bash
+./scripts/patch_client.py --ip 192.168.1.50             # your bridge's LAN IP
+./scripts/patch_client.py --dry-run --ip 192.168.1.50   # preview
+./scripts/patch_client.py --verify --expect 192.168.1.50  # confirm (exit 0 only if fully patched)
+./scripts/patch_client.py --restore                     # revert
+```
+
+This rewrites all **74 hardcoded CM address slots** in `steamclient.dylib` —
+the client tries those without DNS — so no `/etc/hosts` edit and no PF
+redirect is needed for the CM layer. The hosts file (Part B of
+[`docs/SETUP.md`](docs/SETUP.md)) is still used for the TLS hosts (store, api,
+community).
+
+### Optional: expose the bridge to the internet (VM + GitHub Actions)
+
+If the Lion Mac is **not** on the same LAN as the bridge, deploy to an
+always-on VM you provide: the **Deploy** workflow (`.github/workflows/deploy.yml`)
+ships the bridge, runs it under systemd, and publishes the VM's public IP to
+`deploy/endpoint.txt` — then patch with `--endpoint-file` instead of `--ip`:
+
+```bash
+./scripts/patch_client.py --endpoint-file deploy/endpoint.txt
+```
+
+Full home + VM deployment guide: [`docs/DEPLOY.md`](docs/DEPLOY.md).
 
 ## Setup
 
