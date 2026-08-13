@@ -6,6 +6,7 @@ from gateway.cm import emsg, machineauth, proto
 from gateway.cm.framing import (
     PROTO_FLAG,
     STRUCT_HEADER_LEN,
+    Frame,
     decode_frame,
     encode_handshake,
     encode_legacy,
